@@ -34,5 +34,3 @@ if not exist "%scriptPath%" (
 ::   Run-RemovePython.bat -CreateBackup:$false
 
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%scriptPath%" %*
-
-pause

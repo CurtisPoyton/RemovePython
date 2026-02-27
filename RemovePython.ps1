@@ -34,11 +34,6 @@
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'CreateBackup', Justification = 'Used in New-RestorePoint')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SkipProcessCheck', Justification = 'Used in Test-RunningProcess')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SkipDiskCheck', Justification = 'Used in Test-DiskSpace')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'IncludeNetworkDrives', Justification = 'Used in Remove-ItemSafely')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'MaxScanDepth', Justification = 'Used in config initialization')]
 param(
     [Parameter(HelpMessage = "Preview mode - no changes will be made")]
     [switch]$ScanOnly,
@@ -357,7 +352,9 @@ function Remove-ItemSafely {
                             if ($itemCount -gt 1000) {
                                 Write-LogMessage -Message "  Removing $itemCount items (this may take a while)..." -Color $script:colors.Warning -Type 'INFO'
                             }
-                        } catch { }
+                        } catch {
+                            # Silently ignore errors when counting items (optional progress information)
+                        }
                     }
 
                     Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
@@ -1393,6 +1390,7 @@ try {
         }
 
         Write-Information "$($script:ansiColors['Gray'])Log file: $($script:config.LogFile)$($script:ansiColors['Reset'])"
+        # Write-Host is required here for interactive prompt (no newline before Read-Host)
         Write-Host "`n$($script:ansiColors['Yellow'])Do you want to continue? [Y]es / [N]o:$($script:ansiColors['Reset']) " -NoNewline
         $confirmation = Read-Host
 
@@ -1434,7 +1432,7 @@ try {
 
     if ($script:config.TotalSize -gt 0) {
         $sizeLabel = if ($ScanOnly) { "Total Size" } else { "Space Freed" }
-        Write-LogMessage -Message "$sizeLabel: $(Format-FileSize $script:config.TotalSize)" -Color $script:colors.Info -Type 'INFO'
+        Write-LogMessage -Message "${sizeLabel}: $(Format-FileSize $script:config.TotalSize)" -Color $script:colors.Info -Type 'INFO'
     }
 
     $mode = if ($ScanOnly) { 'Scan' } else { 'Cleanup' }
