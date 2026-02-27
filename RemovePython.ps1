@@ -1319,8 +1319,12 @@ function New-Report {
 
     if ($script:config.ItemsFound.Count -gt 0) {
         if ($PSCmdlet.ShouldProcess($script:config.ReportFile, "Create Report")) {
-            $script:config.ItemsFound | Export-Csv -Path $script:config.ReportFile -NoTypeInformation -Encoding UTF8
-            Write-LogMessage -Message "Report generated: $($script:config.ReportFile)" -Color $script:colors.Success -Type 'REPORT'
+            try {
+                $script:config.ItemsFound | Export-Csv -Path $script:config.ReportFile -NoTypeInformation -Encoding UTF8
+                Write-LogMessage -Message "Report generated: $($script:config.ReportFile)" -Color $script:colors.Success -Type 'REPORT'
+            } catch {
+                Write-LogMessage -Message "Failed to generate report: $($_.Exception.Message)" -Color $script:colors.Error -Type 'ERROR'
+            }
         }
     }
 }
@@ -1340,9 +1344,10 @@ try {
         Write-Information "`n$($script:ansiColors['Yellow'])WARNING: This will permanently remove all Python installations and related files.$($script:ansiColors['Reset'])"
         Write-Information "  - All Python installations (traditional, Microsoft Store, Anaconda, etc.)"
         Write-Information "  - Virtual environments (.venv, venv, conda envs)"
-        Write-Information "  - Package caches (pip, uv, poetry, rye)"
+        Write-Information "  - Package caches (pip, UV - auto-reinstalled only)"
         Write-Information "  - Environment variables and PATH entries"
-        Write-Information "  - Registry keys and file associations`n"
+        Write-Information "  - Registry keys and file associations"
+        Write-Information "  - Preserves: Poetry, PDM, Rye, Hatch, pipx, Jupyter (tools remain functional)`n"
 
         if ($CreateBackup) {
             Write-Information "$($script:ansiColors['Cyan'])A system restore point will be created before removal.$($script:ansiColors['Reset'])`n"

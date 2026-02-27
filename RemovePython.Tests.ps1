@@ -993,6 +993,264 @@ Describe 'PRIORITY 4: Integration & Coverage Tests' -Tag 'Integration' {
     }
 }
 
+Describe 'PRIORITY 5: Additional Function Coverage' -Tag 'Coverage' {
+
+    Context 'Get-SafeFolderSize' {
+
+        It 'Returns 0 for non-existent path' {
+            Get-SafeFolderSize -Path 'C:\NonExistentFolder12345' | Should -Be 0
+        }
+
+        It 'Returns 0 or null for empty directory' {
+            $emptyDir = Join-Path $TestDrive 'empty'
+            New-Item -Path $emptyDir -ItemType Directory -Force | Out-Null
+            $result = Get-SafeFolderSize -Path $emptyDir
+            # Empty directory returns 0 or $null (both acceptable)
+            ($result -eq 0 -or $null -eq $result) | Should -Be $true
+        }
+
+        It 'Calculates size for directory with files' {
+            $testDir = Join-Path $TestDrive 'sizetest'
+            New-Item -Path $testDir -ItemType Directory -Force | Out-Null
+            'test content' | Out-File (Join-Path $testDir 'file1.txt')
+
+            $size = Get-SafeFolderSize -Path $testDir
+            $size | Should -BeGreaterThan 0
+        }
+
+        It 'Returns 0 on error (access denied simulation)' {
+            Mock Get-ChildItem { throw "Access denied" }
+            Get-SafeFolderSize -Path $TestDrive | Should -Be 0
+        }
+    }
+
+    Context 'Test-DiskSpace' {
+
+        It 'Returns true when SkipDiskCheck is set' {
+            $script:SkipDiskCheck = $true
+            Test-DiskSpace | Should -Be $true
+            $script:SkipDiskCheck = $false
+        }
+
+        It 'Returns true when sufficient disk space available' {
+            $script:SkipDiskCheck = $false
+            $script:config.MinFreeDiskSpaceGB = 1
+            Test-DiskSpace | Should -Be $true
+        }
+
+        It 'Handles errors gracefully and returns true' {
+            Mock Get-PSDrive { throw "Drive error" }
+            Test-DiskSpace | Should -Be $true
+        }
+    }
+
+    Context 'New-Report' {
+
+        BeforeEach {
+            $script:config.ItemsFound.Clear()
+            $script:config.ReportFile = Join-Path $TestDrive "test_report_$(Get-Random).csv"
+        }
+
+        It 'Creates CSV when ItemsFound has entries' {
+            Add-Finding -Type 'Test' -Name 'TestItem' -Path 'C:\Test' -SizeBytes 1024
+
+            New-Report
+
+            Test-Path $script:config.ReportFile | Should -Be $true
+        }
+
+        It 'CSV contains correct data' {
+            Add-Finding -Type 'File' -Name 'test.txt' -Path 'C:\test.txt' -SizeBytes 2048
+
+            New-Report
+
+            $report = Import-Csv $script:config.ReportFile
+            $report.Count | Should -Be 1
+            $report[0].Type | Should -Be 'File'
+            $report[0].Name | Should -Be 'test.txt'
+        }
+
+        It 'Does not create CSV when ItemsFound is empty' {
+            # Ensure ItemsFound is truly empty
+            $script:config.ItemsFound.Clear()
+
+            New-Report
+
+            Test-Path $script:config.ReportFile | Should -Be $false
+        }
+
+        It 'Handles Export-Csv failure gracefully' {
+            Add-Finding -Type 'Test' -Name 'Item' -Path 'C:\Test' -SizeBytes 100
+
+            Mock Export-Csv { throw "Disk full" }
+
+            { New-Report } | Should -Not -Throw
+        }
+    }
+
+    Context 'New-RestorePoint (Mocked)' {
+
+        BeforeEach {
+            $script:ScanOnly = $false
+            $script:CreateBackup = $true
+        }
+
+        AfterEach {
+            $script:ScanOnly = $false
+            $script:CreateBackup = $true
+        }
+
+        It 'Skips when ScanOnly is true' {
+            $script:ScanOnly = $true
+            Mock Invoke-CimMethod { }
+
+            New-RestorePoint
+
+            Should -Not -Invoke Invoke-CimMethod
+        }
+
+        It 'Skips when CreateBackup is false' {
+            $script:CreateBackup = $false
+            Mock Invoke-CimMethod { }
+
+            New-RestorePoint
+
+            Should -Not -Invoke Invoke-CimMethod
+        }
+
+        It 'Uses uint32 casting for parameters' {
+            Mock Invoke-CimMethod {
+                param($Namespace, $ClassName, $MethodName, $Arguments)
+                $Arguments.RestorePointType | Should -BeOfType [uint32]
+                $Arguments.EventType | Should -BeOfType [uint32]
+                return @{ ReturnValue = 0 }
+            }
+
+            New-RestorePoint
+        }
+
+        It 'Handles CIM method failure gracefully' {
+            Mock Invoke-CimMethod { throw "Access denied" }
+
+            { New-RestorePoint } | Should -Not -Throw
+        }
+    }
+
+    Context 'Test-RunningProcess (Basic Tests)' {
+
+        It 'Function exists and is callable' {
+            Get-Command Test-RunningProcess | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Skips when SkipProcessCheck is true' {
+            $script:SkipProcessCheck = $true
+            Mock Get-Process { }
+
+            Test-RunningProcess
+
+            Should -Not -Invoke Get-Process
+            $script:SkipProcessCheck = $false
+        }
+    }
+
+    Context 'Remove-AppExecutionAlias (Mocked)' {
+
+        It 'Function exists and is callable' {
+            Get-Command Remove-AppExecutionAlias | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Checks for WindowsApps directory' {
+            Mock Test-Path { $false }
+            Mock Get-ChildItem { }
+
+            Remove-AppExecutionAlias
+
+            Should -Invoke Test-Path -ParameterFilter { $Path -like '*WindowsApps*' }
+        }
+    }
+
+    Context 'Test-PostRemoval' {
+
+        It 'Function exists and is callable' {
+            Get-Command Test-PostRemoval | Should -Not -BeNullOrEmpty
+        }
+    }
+}
+
+Describe 'PRIORITY 6: Edge Cases & Error Handling' -Tag 'EdgeCases' {
+
+    Context 'Long Path Handling' {
+
+        It 'Test-PathSafe handles long paths' {
+            $longPath = 'C:\' + ('a' * 300)
+            # Should not throw, returns either true or false
+            { Test-PathSafe -Path $longPath } | Should -Not -Throw
+        }
+    }
+
+    Context 'Special Characters in Paths' {
+
+        It 'Test-PathSafe handles paths with spaces' {
+            Test-PathSafe -Path 'C:\Program Files\Python39' | Should -Be $true
+        }
+
+        It 'Test-PathSafe handles paths with parentheses' {
+            Test-PathSafe -Path 'C:\Program Files (x86)\Python39' | Should -Be $true
+        }
+
+        It 'Test-PathSafe handles paths with dots' {
+            Test-PathSafe -Path 'C:\Users\user.name\Python39' | Should -Be $true
+        }
+    }
+
+    Context 'Parameter Validation' {
+
+        It 'Script accepts MaxScanDepth minimum (3)' {
+            # This tests parameter validation is set correctly
+            $scriptPath = Join-Path $PSScriptRoot 'RemovePython.ps1'
+            $params = (Get-Command $scriptPath).Parameters
+            $params['MaxScanDepth'].Attributes.MinRange | Should -Be 3
+        }
+
+        It 'Script accepts MaxScanDepth maximum (15)' {
+            $scriptPath = Join-Path $PSScriptRoot 'RemovePython.ps1'
+            $params = (Get-Command $scriptPath).Parameters
+            $params['MaxScanDepth'].Attributes.MaxRange | Should -Be 15
+        }
+
+        It 'Script accepts TimeoutSeconds minimum (60)' {
+            $scriptPath = Join-Path $PSScriptRoot 'RemovePython.ps1'
+            $params = (Get-Command $scriptPath).Parameters
+            $params['TimeoutSeconds'].Attributes.MinRange | Should -Be 60
+        }
+
+        It 'Script accepts MinFreeDiskSpaceGB minimum (1)' {
+            $scriptPath = Join-Path $PSScriptRoot 'RemovePython.ps1'
+            $params = (Get-Command $scriptPath).Parameters
+            $params['MinFreeDiskSpaceGB'].Attributes.MinRange | Should -Be 1
+        }
+    }
+
+    Context 'Error Recovery' {
+
+        BeforeEach {
+            $script:config.ItemsRemoved = 0
+            $script:config.ItemsFailed = 0
+        }
+
+        It 'Remove-ItemSafely increments ItemsFailed when deletion throws' {
+            $testFile = Join-Path $TestDrive 'locked.txt'
+            'test' | Out-File $testFile
+
+            Mock Remove-Item { throw "File is locked" }
+
+            Remove-ItemSafely -Path $testFile -Description 'Test' -Type 'File'
+
+            $script:config.ItemsFailed | Should -BeGreaterThan 0
+        }
+    }
+}
+
 # Test Summary
 Describe 'Test Suite Summary' -Tag 'Meta' {
     It 'Loaded functions from RemovePython.ps1' {
