@@ -11,10 +11,11 @@
     - Traditional MSI/EXE installations (Python, Anaconda, Miniconda, etc.)
     - Environment variables (PATH, PYTHONPATH, etc.)
     - Virtual environments (venv, .venv, conda envs)
-    - Package caches (pip, poetry, uv, rye)
+    - Package caches (pip, UV - auto-reinstalled tools only)
     - Registry keys and file associations
-    - Jupyter/IPython kernels and configs
     - App execution aliases
+
+    Preserves package manager tools (Poetry, PDM, Rye, Hatch, pipx, Jupyter) and their configurations.
 
 .EXAMPLE
     .\RemovePython.ps1
@@ -107,8 +108,8 @@ $script:ansiColors = @{
 }
 
 $script:pythonPatterns = @{
-    PathEntries  = '(^|\\)(python\d*|\.venv|venv|Scripts|Anaconda\d*|Miniconda\d*|Mambaforge|Miniforge|conda|pyenv|pipx|poetry|pdm|rye|uv|hatch|virtualenv|site-packages|dist-packages|pip|wheel|IPython|jupyter|nbconvert|astral|mise|asdf)(\\|$)|\.python-version'
-    ProcessNames = '^python(w)?(\d+(\.\d+)?)?$|^pip(\d+)?$|^conda$|^mamba$|^anaconda$|^poetry$|^pdm$|^pipx$|^rye$|^uv$|^hatch$|^jupyter|^ipython|^pyinstaller|^pylint|^pytest|^mypy|^black|^ruff|^flake8|^virtualenv|^pydoc|^idle|^sphinx'
+    PathEntries  = '(^|\\)(python\d*|\.venv|\.pyenv|\.virtualenvs?|Anaconda\d*|Miniconda\d*|Mambaforge|Miniforge|conda|site-packages|dist-packages)(\\|$)|\\(pyenv|virtualenv)\\|\.python-version'
+    ProcessNames = '^python(w)?(\d+(\.\d+)?)?$|^pip(\d+)?$|^conda$|^mamba$|^anaconda$|^jupyter|^ipython|^pyinstaller|^pylint|^pytest|^mypy|^black|^ruff|^flake8|^virtualenv|^pydoc|^idle|^sphinx'
 }
 
 $script:protectedPaths = @(
@@ -139,11 +140,7 @@ $script:pythonVariables = @(
     'MINICONDA_HOME', 'MAMBA_EXE', 'MAMBA_ROOT_PREFIX', 'MAMBA_NO_BANNER',
     'CONDA_CHANNELS', 'CONDA_AUTO_UPDATE_CONDA',
     'PYENV', 'PYENV_ROOT', 'PYENV_SHELL', 'PYENV_VERSION', 'PYENV_DIR',
-    'POETRY_HOME', 'POETRY_CACHE_DIR', 'POETRY_CONFIG_DIR', 'POETRY_DATA_DIR',
-    'PDM_HOME', 'PDM_CACHE_DIR', 'RYE_HOME', 'PIPX_HOME', 'PIPX_BIN_DIR',
-    'UV_CACHE_DIR', 'UV_TOOL_DIR', 'UV_PYTHON', 'HATCH_HOME',
-    'PIP_CONFIG_FILE', 'PIP_CACHE_DIR', 'JUPYTER_CONFIG_DIR', 'JUPYTER_DATA_DIR',
-    'IPYTHONDIR', 'PYLAUNCHER_ALLOW_INSTALL', 'PY_PYTHON'
+    'PYLAUNCHER_ALLOW_INSTALL', 'PY_PYTHON'
 )
 #endregion
 
@@ -173,11 +170,18 @@ function Write-LogMessage {
 
 function Test-PathSafe {
     param(
-        [Parameter(Mandatory)]
+        [AllowNull()]
+        [AllowEmptyString()]
         [string]$Path
     )
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+    # Check for bare drive letter (C:, D:, etc.) before normalization
+    if ($Path -match '^[A-Za-z]:$') {
+        Write-LogMessage -Message "[X] Root drive blocked: $Path" -Color $script:colors.Critical -Type 'PROTECT'
+        return $false
+    }
 
     try {
         $normalizedPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -615,6 +619,7 @@ function Remove-PythonDirectory {
         "$env:APPDATA\pip",
         "$env:USERPROFILE\.cache\pip",
         "$env:LOCALAPPDATA\pip-cache",
+        "$env:LOCALAPPDATA\pip-audit",
 
         # UV (Astral)
         "$env:USERPROFILE\.uv",
@@ -625,49 +630,12 @@ function Remove-PythonDirectory {
         "$env:APPDATA\astral",
         "$env:USERPROFILE\.astral",
 
-        # Poetry
-        "$env:APPDATA\pypoetry",
-        "$env:LOCALAPPDATA\pypoetry",
-        "$env:USERPROFILE\.poetry",
-        "$env:APPDATA\poetry",
-        "$env:USERPROFILE\.cache\poetry",
-        "$env:USERPROFILE\.cache\pypoetry",
-
-        # PDM
-        "$env:USERPROFILE\.pdm",
-        "$env:LOCALAPPDATA\pdm",
-        "$env:USERPROFILE\.cache\pdm",
-
-        # Rye
-        "$env:USERPROFILE\.rye",
-        "$env:USERPROFILE\.cache\rye",
-
-        # Hatch
-        "$env:LOCALAPPDATA\hatch",
-        "$env:USERPROFILE\.cache\hatch",
-
-        # pipx
-        "$env:USERPROFILE\.local\pipx",
-        "$env:LOCALAPPDATA\pipx",
-        "$env:USERPROFILE\.cache\pipx",
-        "$env:USERPROFILE\.local\share\pipx",
-
         # virtualenv/virtualenvwrapper
         "$env:USERPROFILE\.virtualenvs",
         "$env:USERPROFILE\.virtualenv",
 
         # Pipenv
         "$env:USERPROFILE\.local\share\virtualenvs",
-
-        # === Jupyter & IPython ===
-        "$env:USERPROFILE\.jupyter",
-        "$env:USERPROFILE\.ipython",
-        "$env:APPDATA\jupyter",
-        "$env:APPDATA\IPython",
-        "$env:LOCALAPPDATA\Jupyter",
-        "$env:LOCALAPPDATA\JupyterLab",
-        "$env:APPDATA\jupyterlab-desktop",
-        "$env:USERPROFILE\.jupyter-desktop",
 
         # === Code Quality Tools Caches ===
         "$env:USERPROFILE\.mypy_cache",
@@ -755,7 +723,6 @@ function Remove-PythonDirectory {
             $shortcuts = @()
             $shortcuts += Get-ChildItem -Path $desktopPath -Filter "Python*.lnk" -ErrorAction SilentlyContinue
             $shortcuts += Get-ChildItem -Path $desktopPath -Filter "Anaconda*.lnk" -ErrorAction SilentlyContinue
-            $shortcuts += Get-ChildItem -Path $desktopPath -Filter "Jupyter*.lnk" -ErrorAction SilentlyContinue
             $shortcuts += Get-ChildItem -Path $desktopPath -Filter "IDLE*.lnk" -ErrorAction SilentlyContinue
 
             foreach ($shortcut in $shortcuts) {
@@ -988,9 +955,7 @@ function Clear-Registry {
         'HKCU:\Software\Continuum Analytics',
         'HKLM:\Software\Continuum Analytics',
 
-        # Package managers
-        'HKCU:\Software\Poetry',
-        'HKLM:\Software\Poetry',
+        # Version managers
         'HKCU:\Software\pyenv',
         'HKLM:\Software\pyenv'
     )
@@ -1025,9 +990,6 @@ function Clear-Registry {
         'HKCU:\Software\Classes\.pth',
         'HKCU:\Software\Classes\.whl',
 
-        # Jupyter/IPython
-        'HKCU:\Software\Classes\.ipynb',
-
         # Python file type handlers
         'HKCU:\Software\Classes\py_auto_file',
         'HKCU:\Software\Classes\pyw_auto_file',
@@ -1042,8 +1004,7 @@ function Clear-Registry {
         'HKCU:\Software\Classes\Applications\pythonw.exe',
         'HKCU:\Software\Classes\Applications\py.exe',
         'HKCU:\Software\Classes\Applications\pyw.exe',
-        'HKCU:\Software\Classes\Applications\idle.exe',
-        'HKCU:\Software\Classes\Applications\ipython.exe'
+        'HKCU:\Software\Classes\Applications\idle.exe'
     )
 
     foreach ($key in $assocKeys) {
