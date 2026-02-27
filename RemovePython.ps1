@@ -27,6 +27,10 @@
 .EXAMPLE
     .\RemovePython.ps1 -CreateBackup:$false
     Skips creating a system restore point before removal.
+
+.EXAMPLE
+    .\RemovePython.ps1 -MaxScanDepth 5
+    Faster virtual environment scan (depth 5 instead of default 8).
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -34,6 +38,7 @@
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SkipProcessCheck', Justification = 'Used in Test-RunningProcess')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SkipDiskCheck', Justification = 'Used in Test-DiskSpace')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'IncludeNetworkDrives', Justification = 'Used in Remove-ItemSafely')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'MaxScanDepth', Justification = 'Used in config initialization')]
 param(
     [Parameter(HelpMessage = "Preview mode - no changes will be made")]
     [switch]$ScanOnly,
@@ -56,7 +61,11 @@ param(
 
     [Parameter(HelpMessage = "Operation timeout in seconds")]
     [ValidateRange(60, 3600)]
-    [int]$TimeoutSeconds = 300
+    [int]$TimeoutSeconds = 300,
+
+    [Parameter(HelpMessage = "Maximum depth for virtual environment scan (lower = faster, higher = more thorough)")]
+    [ValidateRange(3, 15)]
+    [int]$MaxScanDepth = 8
 )
 
 $ErrorActionPreference = 'Continue'
@@ -76,7 +85,7 @@ $script:config = @{
     ItemsSkipped       = 0
     TotalSize          = [int64]0
     StartTime          = Get-Date
-    MaxDepth           = 8
+    MaxDepth           = $MaxScanDepth
     TimeoutSeconds     = $TimeoutSeconds
     MinFreeDiskSpaceGB = $MinFreeDiskSpaceGB
 }
@@ -309,10 +318,12 @@ function Remove-ItemSafely {
         return
     }
 
-    $sizeBytes = if ($ScanOnly) { Get-SafeFolderSize $Path } else { 0 }
+    # Calculate size before removal (for metrics)
+    $sizeBytes = Get-SafeFolderSize $Path
     Add-Finding -Type $Type -Name $Description -Path $Path -SizeBytes $sizeBytes
 
-    if ($ScanOnly) {
+    # Display found message with size
+    if ($sizeBytes -gt 0) {
         Write-LogMessage -Message "Found: $Description ($(Format-FileSize $sizeBytes))" -Color $script:colors.Found -Type 'FOUND'
     } else {
         Write-LogMessage -Message "Found: $Description" -Color $script:colors.Found -Type 'FOUND'
@@ -368,6 +379,7 @@ function Remove-ItemSafely {
                 }
             }
             $script:config.ItemsRemoved++
+            $script:config.TotalSize += $sizeBytes
         }
     } catch {
         Write-LogMessage -Message "  [X] Failed: $($_.Exception.Message)" -Color $script:colors.Error -Type 'ERROR'
@@ -414,6 +426,10 @@ function Uninstall-TraditionalPython {
 
     Write-LogMessage -Message "`n=== TRADITIONAL INSTALLATIONS ===" -Color $script:colors.Header -Type 'SECTION'
 
+    if (-not $ScanOnly) {
+        Write-LogMessage -Message "Note: MSI component dependency failures (exit 1603) are expected and will be cleaned via orphaned registry entry removal" -Color $script:colors.Info -Type 'INFO'
+    }
+
     $uninstallPaths = @(
         'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -441,35 +457,57 @@ function Uninstall-TraditionalPython {
                     if ($cmd -match '\{[A-F0-9-]+\}') {
                         $code = $matches[0]
                         Write-LogMessage -Message "  Running MSI Uninstall for $code..." -Color $script:colors.Info -Type 'INFO'
-                        try {
-                            $proc = Start-Process 'MsiExec.exe' -ArgumentList "/X $code /qn /norestart" -PassThru -NoNewWindow
-                            $timeoutMs = $script:config.TimeoutSeconds * 1000
-                            if ($proc.WaitForExit($timeoutMs)) {
-                                if ($proc.ExitCode -in @(0, 3010)) {
-                                    $uninstallSuccess = $true
-                                    Write-LogMessage -Message "  [OK] MSI Uninstalled (exit code: $($proc.ExitCode))" -Color $script:colors.Success -Type 'REMOVE'
-                                    $script:config.ItemsRemoved++
-                                } else {
-                                    $errorDetail = switch ($proc.ExitCode) {
-                                        1601 { "Windows Installer service not accessible or access denied" }
-                                        1602 { "User cancelled installation" }
-                                        1603 { "Fatal error during installation/uninstallation" }
-                                        1605 { "Product not found or already uninstalled" }
-                                        1618 { "Another installation is in progress" }
-                                        1619 { "Failed to open installation package" }
-                                        1633 { "Platform not supported (x86/x64 mismatch)" }
-                                        default { "Unknown MSI error" }
+
+                        # Try up to 2 times for transient errors (1618 = another install in progress)
+                        $maxAttempts = 2
+                        $attemptNum = 0
+                        $lastExitCode = 0
+
+                        while ($attemptNum -lt $maxAttempts -and -not $uninstallSuccess) {
+                            $attemptNum++
+                            try {
+                                $proc = Start-Process 'MsiExec.exe' -ArgumentList "/X $code /qn /norestart" -PassThru -NoNewWindow
+                                $timeoutMs = $script:config.TimeoutSeconds * 1000
+                                if ($proc.WaitForExit($timeoutMs)) {
+                                    $lastExitCode = $proc.ExitCode
+                                    if ($proc.ExitCode -in @(0, 3010)) {
+                                        $uninstallSuccess = $true
+                                        Write-LogMessage -Message "  [OK] MSI Uninstalled (exit code: $($proc.ExitCode))" -Color $script:colors.Success -Type 'REMOVE'
+                                        $script:config.ItemsRemoved++
+                                    } elseif ($proc.ExitCode -eq 1618 -and $attemptNum -lt $maxAttempts) {
+                                        # Another installation in progress - retry after delay
+                                        Write-LogMessage -Message "  [!] Another installation in progress, retrying in 5 seconds..." -Color $script:colors.Warning -Type 'INFO'
+                                        Start-Sleep -Seconds 5
+                                    } else {
+                                        # Non-retriable error or max attempts reached
+                                        break
                                     }
-                                    Write-LogMessage -Message "  [X] MSI failed (exit code: $($proc.ExitCode)) - $errorDetail" -Color $script:colors.Error -Type 'ERROR'
+                                } else {
+                                    $proc.Kill()
+                                    Write-LogMessage -Message "  [X] MSI timeout after $($script:config.TimeoutSeconds)s" -Color $script:colors.Error -Type 'ERROR'
                                     $script:config.ItemsFailed++
+                                    break
                                 }
-                            } else {
-                                $proc.Kill()
-                                Write-LogMessage -Message "  [X] MSI timeout after $($script:config.TimeoutSeconds)s" -Color $script:colors.Error -Type 'ERROR'
+                            } catch {
+                                Write-LogMessage -Message "  [X] MSI error: $($_.Exception.Message)" -Color $script:colors.Error -Type 'ERROR'
                                 $script:config.ItemsFailed++
+                                break
                             }
-                        } catch {
-                            Write-LogMessage -Message "  [X] MSI error: $($_.Exception.Message)" -Color $script:colors.Error -Type 'ERROR'
+                        }
+
+                        # If still not successful after retries, log the final error
+                        if (-not $uninstallSuccess -and $lastExitCode -ne 0) {
+                            $errorDetail = switch ($lastExitCode) {
+                                1601 { "Windows Installer service not accessible or access denied" }
+                                1602 { "User cancelled installation" }
+                                1603 { "Fatal error during installation/uninstallation" }
+                                1605 { "Product not found or already uninstalled" }
+                                1618 { "Another installation is in progress (tried $attemptNum times)" }
+                                1619 { "Failed to open installation package" }
+                                1633 { "Platform not supported (x86/x64 mismatch)" }
+                                default { "Unknown MSI error" }
+                            }
+                            Write-LogMessage -Message "  [X] MSI failed (exit code: $lastExitCode) - $errorDetail" -Color $script:colors.Error -Type 'ERROR'
                             $script:config.ItemsFailed++
                         }
                     }
@@ -1395,7 +1433,8 @@ try {
     }
 
     if ($script:config.TotalSize -gt 0) {
-        Write-LogMessage -Message "Total Size: $(Format-FileSize $script:config.TotalSize)" -Color $script:colors.Info -Type 'INFO'
+        $sizeLabel = if ($ScanOnly) { "Total Size" } else { "Space Freed" }
+        Write-LogMessage -Message "$sizeLabel: $(Format-FileSize $script:config.TotalSize)" -Color $script:colors.Info -Type 'INFO'
     }
 
     $mode = if ($ScanOnly) { 'Scan' } else { 'Cleanup' }
