@@ -433,7 +433,8 @@ function Uninstall-TraditionalPython {
 
         if (-not $ScanOnly -and $install.UninstallString) {
             if ($PSCmdlet.ShouldProcess($name, "Uninstall Program")) {
-                $cmd = $install.UninstallString.Trim('"')
+                $cmdOriginal = $install.UninstallString
+                $cmd = $cmdOriginal.Trim()
                 $uninstallSuccess = $false
 
                 if ($cmd -match 'MsiExec') {
@@ -473,9 +474,27 @@ function Uninstall-TraditionalPython {
                         }
                     }
                 } elseif ($install.UninstallString -match '\.exe') {
-                    Write-LogMessage -Message "  Attempting EXE uninstall: $cmd" -Color $script:colors.Info -Type 'INFO'
-                    $exePath = if ($cmd -match '^"([^"]+)"') { $matches[1] } else { ($cmd -split '\s+')[0] }
-                    if (Test-Path $exePath) {
+                    Write-LogMessage -Message "  Attempting EXE uninstall: $cmdOriginal" -Color $script:colors.Info -Type 'INFO'
+
+                    # Extract executable path - handle quoted paths with spaces
+                    $exePath = $null
+                    if ($cmd -match '^"([^"]+\.exe)"') {
+                        # Quoted path: "C:\Path With Spaces\installer.exe" /args
+                        $exePath = $matches[1]
+                    } elseif ($cmd -match '^([^"\s]+\.exe)') {
+                        # Unquoted path (no spaces): C:\Path\installer.exe /args
+                        $exePath = $matches[1]
+                    } else {
+                        # Fallback: try to find .exe in the string
+                        if ($cmd -match '([A-Z]:\\[^"]*?\.exe)') {
+                            $exePath = $matches[1]
+                        }
+                    }
+
+                    if (-not $exePath) {
+                        Write-LogMessage -Message "  [!] Could not extract EXE path from: $cmd" -Color $script:colors.Warning -Type 'WARN'
+                        $script:config.ItemsSkipped++
+                    } elseif (Test-Path $exePath) {
                         $silentArgs = @('/uninstall', '/S', '/SILENT', '/quiet', '/VERYSILENT', '-uninstall')
                         $attemptCount = 0
                         foreach ($arg in $silentArgs) {
@@ -503,7 +522,7 @@ function Uninstall-TraditionalPython {
                         }
                         if (-not $uninstallSuccess) {
                             Write-LogMessage -Message "  [X] EXE auto-uninstall failed - may require manual removal" -Color $script:colors.Error -Type 'ERROR'
-                            Write-LogMessage -Message "  Manual uninstall command: $cmd" -Color $script:colors.Info -Type 'MANUAL'
+                            Write-LogMessage -Message "  Manual uninstall command: $cmdOriginal" -Color $script:colors.Info -Type 'MANUAL'
                             $script:config.ItemsFailed++
                         }
                     } else {
@@ -652,6 +671,8 @@ function Remove-PythonDirectory {
     }
 
     # === Individual Config Files ===
+    Write-LogMessage -Message "`n=== CONFIG FILES ===" -Color $script:colors.Header -Type 'SECTION'
+
     $configFiles = @(
         "$env:USERPROFILE\.condarc",
         "$env:USERPROFILE\.python-version",
@@ -662,8 +683,10 @@ function Remove-PythonDirectory {
         "$env:USERPROFILE\pip\pip.ini"
     )
 
+    $configFilesFound = 0
     foreach ($file in $configFiles) {
         if (Test-Path $file) {
+            $configFilesFound++
             $fileName = Split-Path $file -Leaf
             Write-LogMessage -Message "Found Config File: $fileName" -Color $script:colors.Found -Type 'FOUND'
             if (-not $ScanOnly -and $PSCmdlet.ShouldProcess($file, "Remove Config File")) {
@@ -679,20 +702,29 @@ function Remove-PythonDirectory {
         }
     }
 
+    if ($configFilesFound -eq 0) {
+        Write-LogMessage -Message "No Python config files found" -Color $script:colors.Info -Type 'INFO'
+    }
+
     # === Desktop Shortcuts ===
+    Write-LogMessage -Message "`n=== DESKTOP SHORTCUTS ===" -Color $script:colors.Header -Type 'SECTION'
+
     $desktopPaths = @(
         "$env:USERPROFILE\Desktop",
         "$env:PUBLIC\Desktop"
     )
 
+    $shortcutsFound = 0
     foreach ($desktopPath in $desktopPaths) {
         if (Test-Path $desktopPath) {
-            $shortcuts = Get-ChildItem -Path $desktopPath -Filter "Python*.lnk" -ErrorAction SilentlyContinue
+            $shortcuts = @()
+            $shortcuts += Get-ChildItem -Path $desktopPath -Filter "Python*.lnk" -ErrorAction SilentlyContinue
             $shortcuts += Get-ChildItem -Path $desktopPath -Filter "Anaconda*.lnk" -ErrorAction SilentlyContinue
             $shortcuts += Get-ChildItem -Path $desktopPath -Filter "Jupyter*.lnk" -ErrorAction SilentlyContinue
             $shortcuts += Get-ChildItem -Path $desktopPath -Filter "IDLE*.lnk" -ErrorAction SilentlyContinue
 
             foreach ($shortcut in $shortcuts) {
+                $shortcutsFound++
                 Write-LogMessage -Message "Found Desktop Shortcut: $($shortcut.Name)" -Color $script:colors.Found -Type 'FOUND'
                 if (-not $ScanOnly -and $PSCmdlet.ShouldProcess($shortcut.FullName, "Remove Shortcut")) {
                     try {
@@ -708,7 +740,13 @@ function Remove-PythonDirectory {
         }
     }
 
+    if ($shortcutsFound -eq 0) {
+        Write-LogMessage -Message "No Python desktop shortcuts found" -Color $script:colors.Info -Type 'INFO'
+    }
+
     # === Temp Files & Installer Cache ===
+    Write-LogMessage -Message "`n=== TEMP FILES & CACHE ===" -Color $script:colors.Header -Type 'SECTION'
+
     $tempLocations = @(
         @{ Path = "$env:TEMP"; Pattern = "pip-*" },
         @{ Path = "$env:TEMP"; Pattern = "easy_install-*" },
@@ -716,6 +754,7 @@ function Remove-PythonDirectory {
         @{ Path = "$env:LOCALAPPDATA\Package Cache"; Pattern = "*python*" }
     )
 
+    $tempFilesFound = 0
     foreach ($location in $tempLocations) {
         if (Test-Path $location.Path) {
             $items = Get-ChildItem -Path $location.Path -Filter $location.Pattern -Force -ErrorAction SilentlyContinue
@@ -724,6 +763,7 @@ function Remove-PythonDirectory {
                 if ($item.PSIsContainer) {
                     $isOld = (Get-Date) - $item.LastWriteTime -gt [TimeSpan]::FromDays(1)
                     if ($isOld -or $location.Path -like "*Package Cache*") {
+                        $tempFilesFound++
                         Write-LogMessage -Message "Found Temp/Cache: $($item.Name)" -Color $script:colors.Found -Type 'FOUND'
                         if (-not $ScanOnly -and $PSCmdlet.ShouldProcess($item.FullName, "Remove Temp/Cache")) {
                             try {
@@ -740,6 +780,10 @@ function Remove-PythonDirectory {
             }
         }
     }
+
+    if ($tempFilesFound -eq 0) {
+        Write-LogMessage -Message "No Python temp files or cache to clean (or all files <1 day old)" -Color $script:colors.Info -Type 'INFO'
+    }
 }
 
 function Remove-VirtualEnvironment {
@@ -753,6 +797,7 @@ function Remove-VirtualEnvironment {
 
     try {
         $dirs = Get-ChildItem -Path $scanRoot -Directory -Recurse -Depth $script:config.MaxDepth -ErrorAction Ignore -Force
+        Write-LogMessage -Message "Scanned $($dirs.Count) directories" -Color $script:colors.Info -Type 'INFO'
 
         # Standard Python virtual environments
         $venvs = $dirs | Where-Object {
@@ -776,6 +821,7 @@ function Remove-VirtualEnvironment {
 
         # Poetry environments (typically in virtualenvs directory, but also in cache)
         $poetryEnvPattern = '*-py*'
+        $poetryEnvs = @()
         if (Test-Path "$env:LOCALAPPDATA\pypoetry\Cache\virtualenvs") {
             $poetryEnvs = Get-ChildItem -Path "$env:LOCALAPPDATA\pypoetry\Cache\virtualenvs" -Filter $poetryEnvPattern -Directory -ErrorAction SilentlyContinue
             foreach ($poetryEnv in $poetryEnvs) {
@@ -784,11 +830,20 @@ function Remove-VirtualEnvironment {
         }
 
         # Pipenv environments
+        $pipenvEnvs = @()
         if (Test-Path "$env:USERPROFILE\.local\share\virtualenvs") {
             $pipenvEnvs = Get-ChildItem -Path "$env:USERPROFILE\.local\share\virtualenvs" -Directory -ErrorAction SilentlyContinue
             foreach ($pipenvEnv in $pipenvEnvs) {
                 Remove-ItemSafely -Path $pipenvEnv.FullName -Description "Pipenv Env: $($pipenvEnv.Name)" -Type 'PipenvEnv'
             }
+        }
+
+        # Summary
+        $totalEnvs = $venvs.Count + $condaEnvs.Count + $poetryEnvs.Count + $pipenvEnvs.Count
+        if ($totalEnvs -eq 0) {
+            Write-LogMessage -Message "No virtual environments found" -Color $script:colors.Info -Type 'INFO'
+        } else {
+            Write-LogMessage -Message "Found $totalEnvs virtual environment(s): $($venvs.Count) venv, $($condaEnvs.Count) conda, $($poetryEnvs.Count) poetry, $($pipenvEnvs.Count) pipenv" -Color $script:colors.Info -Type 'INFO'
         }
     } catch {
         Write-LogMessage -Message "Scan interrupted: $($_.Exception.Message)" -Color $script:colors.Info -Type 'INFO'
@@ -1027,6 +1082,7 @@ function Clear-Registry {
 
                             # Remove orphaned entries (installation no longer exists)
                             if (-not $installExists) {
+                                Add-Finding -Type 'Registry' -Name "Orphaned: $($props.DisplayName)" -Path $entry.PSPath -Status 'Found'
                                 Write-LogMessage -Message "Found Orphaned Uninstall Entry: $($props.DisplayName)" -Color $script:colors.Found -Type 'FOUND'
                                 if (-not $ScanOnly -and $PSCmdlet.ShouldProcess($entry.PSPath, "Remove Orphaned Uninstall Entry")) {
                                     try {
@@ -1059,6 +1115,7 @@ function Clear-Registry {
                 if ($prop.Name -match '(python|anaconda|miniconda|\.pyd)' -and $prop.Name -ne 'PSPath' -and $prop.Name -ne 'PSParentPath' -and $prop.Name -ne 'PSChildName' -and $prop.Name -ne 'PSDrive' -and $prop.Name -ne 'PSProvider') {
                     # Check if DLL still exists
                     if (-not (Test-Path $prop.Name)) {
+                        Add-Finding -Type 'Registry' -Name "Orphaned DLL: $(Split-Path $prop.Name -Leaf)" -Path $prop.Name -Status 'Found'
                         Write-LogMessage -Message "Found Orphaned SharedDLL: $($prop.Name)" -Color $script:colors.Found -Type 'FOUND'
                         if (-not $ScanOnly -and $PSCmdlet.ShouldProcess($prop.Name, "Remove SharedDLL Entry")) {
                             try {
@@ -1117,11 +1174,14 @@ function Remove-AppExecutionAlias {
     $aliasPath = "$env:LOCALAPPDATA\Microsoft\WindowsApps"
 
     if (Test-Path $aliasPath) {
-        $pythonAliases = Get-ChildItem -Path $aliasPath -Filter "python*.exe" -ErrorAction SilentlyContinue
+        $pythonAliases = @()
+        $pythonAliases += Get-ChildItem -Path $aliasPath -Filter "python*.exe" -ErrorAction SilentlyContinue
         $pythonAliases += Get-ChildItem -Path $aliasPath -Filter "pip*.exe" -ErrorAction SilentlyContinue
 
+        $aliasCount = 0
         foreach ($alias in $pythonAliases) {
             if ($alias.Length -le 1KB) {
+                $aliasCount++
                 Write-LogMessage -Message "Found App Alias: $($alias.Name)" -Color $script:colors.Found -Type 'FOUND'
                 if (-not $ScanOnly -and $PSCmdlet.ShouldProcess($alias.FullName, "Remove App Alias")) {
                     try {
@@ -1134,6 +1194,10 @@ function Remove-AppExecutionAlias {
                     }
                 }
             }
+        }
+
+        if ($aliasCount -eq 0) {
+            Write-LogMessage -Message "No Python app aliases found" -Color $script:colors.Info -Type 'INFO'
         }
     }
 }
@@ -1148,22 +1212,28 @@ function Test-PostRemoval {
     try {
         $wherePython = where.exe python 2>$null
         if ($wherePython) {
+            Write-LogMessage -Message "  [X] Python in PATH: $wherePython" -Color $script:colors.Error -Type 'VERIFY'
             $issuesFound += "Python executable in PATH: $wherePython"
             $pythonFound = $true
+        } else {
+            Write-LogMessage -Message "  [OK] No python.exe in PATH" -Color $script:colors.Success -Type 'VERIFY'
         }
     } catch {
-        $null = $_
+        Write-LogMessage -Message "  [OK] No python.exe in PATH" -Color $script:colors.Success -Type 'VERIFY'
     }
 
     # Check for py launcher
     try {
         $wherePy = where.exe py 2>$null
         if ($wherePy) {
+            Write-LogMessage -Message "  [X] py.exe in PATH: $wherePy" -Color $script:colors.Error -Type 'VERIFY'
             $issuesFound += "Python Launcher (py.exe) in PATH: $wherePy"
             $pythonFound = $true
+        } else {
+            Write-LogMessage -Message "  [OK] No py.exe in PATH" -Color $script:colors.Success -Type 'VERIFY'
         }
     } catch {
-        $null = $_
+        Write-LogMessage -Message "  [OK] No py.exe in PATH" -Color $script:colors.Success -Type 'VERIFY'
     }
 
     # Comprehensive registry check
@@ -1181,11 +1251,18 @@ function Test-PostRemoval {
         'HKLM:\Software\Miniconda'
     )
 
+    $regKeysFound = 0
     foreach ($key in $regKeys) {
         if (Test-Path $key) {
             $issuesFound += "Registry key: $key"
             $pythonFound = $true
+            $regKeysFound++
         }
+    }
+    if ($regKeysFound -eq 0) {
+        Write-LogMessage -Message "  [OK] No registry keys ($($regKeys.Count) locations checked)" -Color $script:colors.Success -Type 'VERIFY'
+    } else {
+        Write-LogMessage -Message "  [X] Found $regKeysFound registry key(s)" -Color $script:colors.Error -Type 'VERIFY'
     }
 
     # Check for Python environment variables
@@ -1196,7 +1273,10 @@ function Test-PostRemoval {
         if ($userVal) { $envVarsStillPresent += "$var (User)" }
         if ($machineVal) { $envVarsStillPresent += "$var (Machine)" }
     }
-    if ($envVarsStillPresent.Count -gt 0) {
+    if ($envVarsStillPresent.Count -eq 0) {
+        Write-LogMessage -Message "  [OK] No environment variables (4 checked)" -Color $script:colors.Success -Type 'VERIFY'
+    } else {
+        Write-LogMessage -Message "  [X] Found $($envVarsStillPresent.Count) environment variable(s)" -Color $script:colors.Error -Type 'VERIFY'
         $issuesFound += "Environment variables: $($envVarsStillPresent -join ', ')"
         $pythonFound = $true
     }
@@ -1208,21 +1288,28 @@ function Test-PostRemoval {
         "C:\Python*",
         "$env:LOCALAPPDATA\Programs\Python*"
     )
+    $dirsFound = 0
     foreach ($pathPattern in $commonPaths) {
         $found = Get-ChildItem -Path (Split-Path $pathPattern -Parent) -Filter (Split-Path $pathPattern -Leaf) -Directory -ErrorAction SilentlyContinue
         if ($found) {
             foreach ($dir in $found) {
                 $issuesFound += "Directory: $($dir.FullName)"
                 $pythonFound = $true
+                $dirsFound++
             }
         }
     }
-
-    # Display results
-    if (-not $pythonFound) {
-        Write-LogMessage -Message "Verification complete: No Python installations detected" -Color $script:colors.Success -Type 'VERIFY'
+    if ($dirsFound -eq 0) {
+        Write-LogMessage -Message "  [OK] No common directories ($($commonPaths.Count) locations checked)" -Color $script:colors.Success -Type 'VERIFY'
     } else {
-        Write-LogMessage -Message "Verification found remaining Python components:" -Color $script:colors.Warning -Type 'VERIFY'
+        Write-LogMessage -Message "  [X] Found $dirsFound Python directory/directories" -Color $script:colors.Error -Type 'VERIFY'
+    }
+
+    # Display final verdict
+    if (-not $pythonFound) {
+        Write-LogMessage -Message "`nVerification: PASSED - System is Python-free" -Color $script:colors.Success -Type 'VERIFY'
+    } else {
+        Write-LogMessage -Message "`nVerification: FAILED - Found remaining Python components:" -Color $script:colors.Warning -Type 'VERIFY'
         foreach ($issue in $issuesFound) {
             Write-LogMessage -Message "  - $issue" -Color $script:colors.Warning -Type 'VERIFY'
         }
@@ -1291,6 +1378,25 @@ try {
     if (-not $ScanOnly) { Test-PostRemoval }
 
     New-Report
+
+    # Summary Statistics
+    Write-LogMessage -Message "`n=== CLEANUP SUMMARY ===" -Color $script:colors.Header -Type 'SECTION'
+    Write-LogMessage -Message "Items Found: $($script:config.ItemsFound.Count)" -Color $script:colors.Info -Type 'INFO'
+    Write-LogMessage -Message "Items Removed: $($script:config.ItemsRemoved)" -Color $script:colors.Success -Type 'INFO'
+    Write-LogMessage -Message "Items Failed: $($script:config.ItemsFailed)" -Color $script:colors.Error -Type 'INFO'
+    Write-LogMessage -Message "Items Skipped: $($script:config.ItemsSkipped)" -Color $script:colors.Warning -Type 'INFO'
+
+    $elapsed = (Get-Date) - $script:config.StartTime
+    Write-LogMessage -Message "Execution Time: $([Math]::Round($elapsed.TotalSeconds, 1))s" -Color $script:colors.Info -Type 'INFO'
+
+    if ($script:config.ItemsRemoved -gt 0) {
+        $successRate = [Math]::Round(($script:config.ItemsRemoved / ($script:config.ItemsRemoved + $script:config.ItemsFailed)) * 100, 1)
+        Write-LogMessage -Message "Success Rate: $successRate%" -Color $script:colors.Success -Type 'INFO'
+    }
+
+    if ($script:config.TotalSize -gt 0) {
+        Write-LogMessage -Message "Total Size: $(Format-FileSize $script:config.TotalSize)" -Color $script:colors.Info -Type 'INFO'
+    }
 
     $mode = if ($ScanOnly) { 'Scan' } else { 'Cleanup' }
     Write-Information "$($script:ansiColors['Green'])`n$mode Complete.$($script:ansiColors['Reset'])"
