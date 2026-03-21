@@ -6,6 +6,3 @@ Python_EnvVars_Backup_*.json
 # Temporary test files
 *.tmp
 *.temp
-
-# Documentation files
-*.md

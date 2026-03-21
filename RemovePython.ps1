@@ -380,7 +380,6 @@ function Remove-ItemSafely {
                 }
             }
             $script:config.ItemsRemoved++
-            $script:config.TotalSize += $sizeBytes
         }
     } catch {
         Write-LogMessage -Message "  [X] Failed: $($_.Exception.Message)" -Color $script:colors.Error -Type 'ERROR'
