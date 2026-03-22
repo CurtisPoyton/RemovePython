@@ -100,7 +100,3 @@ See [CLAUDE.md](CLAUDE.md) for development guidelines and architecture details.
 ## License
 
 **Use at your own risk.** Always create a system restore point (enabled by default), backup data, test with `-ScanOnly` first, and close Python applications before running.
-
----
-
-**v1.0 (2026-02-28)** - Production-ready: 158+ locations, 4 venv types, comprehensive safety, progress tracking, detailed logging
