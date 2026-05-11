@@ -2,7 +2,7 @@
 
 PowerShell script for completely removing Python installations and artifacts from Windows systems.
 
-**Version 1.0** | **158+ cleanup locations** | **Production-ready**
+**Version 1.1** | **200+ cleanup locations** | **Production-ready**
 
 ## Warning
 
@@ -10,9 +10,9 @@ PowerShell script for completely removing Python installations and artifacts fro
 
 ## Features
 
-- **Comprehensive cleanup** - Microsoft Store & traditional installations, virtual environments (4 types), package managers, 58+ registry keys, environment variables, config files, caches, shortcuts
+- **Comprehensive cleanup** - Microsoft Store & traditional installations, virtual environments (4 types), package managers, 90+ registry keys (HKCU + HKLM), environment variables, config files, caches, shortcuts, PowerShell profiles
 - **Safety** - Protected path validation, system restore points, confirmation prompts, WhatIf/ScanOnly support
-- **Progress & logging** - Real-time feedback, detailed logs, CSV reports
+- **Progress & logging** - Real-time progress bar, detailed logs, CSV reports
 
 ## Requirements
 
@@ -38,11 +38,12 @@ Run-RemovePython.bat
 - **Development tools** - Jupyter, IPython, MyPy, Pytest, Ruff, Pylint, Black, Tox, Nox
 - **Environments** - venv, conda, poetry, pipenv
 - **Caches** - pip, UV, conda, poetry, temp files (age-checked)
-- **Registry** - 58+ keys, 21 file associations (.py, .pyw, .pyc, etc.)
+- **Registry** - 90+ keys (HKCU + HKLM), file associations, UserChoice, app paths, shared DLLs
 - **System** - Environment variables, shortcuts, aliases
 - **Config files** - .condarc, .pypirc, pip.ini, .python-version, etc.
+- **PowerShell profiles** - Conda init blocks (auto-removed with backup), other Python lines (warned)
 
-**Preserved:** IDEs (PyCharm, VS Code), user scripts outside Python locations, data files
+**Preserved:** IDEs (PyCharm, VS Code), user scripts outside Python locations, data files. Tool binaries (Poetry, PDM, Rye, Hatch, pipx, Jupyter) are preserved but require Python reinstall to function.
 
 ## Parameters
 
@@ -63,9 +64,10 @@ Run-RemovePython.bat
 - User confirmation prompt with detailed warning
 - System restore point created by default
 - Age-based temp cleanup (>1 day old)
-- Smart orphan detection (registry)
+- Smart orphan detection (registry — handles paths with spaces correctly)
 - Comprehensive error handling and logging
 - WhatIf/ScanOnly support for preview
+- PSScriptAnalyzer clean (0 violations across all rules)
 
 ## Usage Examples
 
