@@ -185,6 +185,7 @@ function Initialize-Configuration {
         StartTime         = [datetime]::Now
         ErrorCountAtStart = $Error.Count
         LogWriter         = $null
+        LogFallbackFrom   = ''
         ExitCode          = 0
     }
 
@@ -468,7 +469,9 @@ function Open-LogFile {
     [OutputType([bool])]
     param()
 
-    foreach ($directory in @($script:config.LogDirectory, $env:TEMP)) {
+    $requested = $script:config.LogDirectory
+
+    foreach ($directory in @($requested, $env:TEMP)) {
         if ([string]::IsNullOrWhiteSpace($directory)) { continue }
         try {
             if (-not (Test-Path -LiteralPath $directory)) {
@@ -479,6 +482,16 @@ function Open-LogFile {
             $writer.AutoFlush = $true
             $script:state.LogWriter = $writer
             $script:config.LogFile = $target
+
+            # The review, CSV and backup must follow the log, or a fallback would leave the log in one
+            # directory and every other artefact failing to write in the directory that was refused.
+            if (-not $directory.Equals($requested, [StringComparison]::OrdinalIgnoreCase)) {
+                foreach ($artefact in 'MarkdownFile', 'ReportFile', 'BackupFile') {
+                    $script:config.$artefact = Join-Path $directory (Split-Path $script:config.$artefact -Leaf)
+                }
+                $script:config.LogDirectory = $directory
+                $script:state.LogFallbackFrom = $requested
+            }
             return $true
         }
         catch [System.IO.IOException] { continue }
@@ -655,6 +668,21 @@ function Format-FileSize {
     return "$value $($unit[$order])"
 }
 
+function Format-Duration {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][timespan]$Elapsed)
+
+    # Round before splitting, or 119.99s renders as "2m 60s": [int] rounds the minutes up while the
+    # remainder rounds up to a full minute of its own.
+    $total = [Math]::Round($Elapsed.TotalSeconds, 1)
+    if ($total -lt 60) { return "${total}s" }
+
+    $minutes = [Math]::Floor($total / 60)
+    $seconds = [Math]::Round($total - ($minutes * 60), 1)
+    return "${minutes}m ${seconds}s"
+}
+
 function Add-BlockedPath {
     [CmdletBinding()]
     param(
@@ -722,7 +750,8 @@ function Test-PathSafe {
         $isSelf = $normalised.Equals($trimmed, [StringComparison]::OrdinalIgnoreCase)
         if ($isSelf -or $isChild) {
             Add-BlockedPath -Path $normalised -Reason "protected location: $trimmed"
-            Write-LogEntry -Tag 'safety' -Level Warn -Message "blocked protected path: $normalised"
+            Write-LogEntry -Tag 'safety' -Level Warn `
+                -Message "blocked protected path: $normalised (protected location: $trimmed)"
             return $false
         }
     }
@@ -772,25 +801,38 @@ function Get-DirectoryStatisticSet {
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [string[]]$Path
+        [string[]]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Tag
     )
 
     $map = @{}
     if ($Path.Count -eq 0) { return $map }
 
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+
     if ($Path.Count -eq 1) {
         $single = Get-DirectoryStatistic -Path $Path[0]
         $map[$single.Path] = $single
-        return $map
+    }
+    else {
+        $throttle = [Math]::Min($Path.Count, $script:config.MaxParallelism)
+        Write-LogEntry -Tag $Tag -Message "sizing $($Path.Count) directories across $throttle worker(s)"
+
+        $definition = ${function:Get-DirectoryStatistic}.ToString()
+        $results = $Path | ForEach-Object -ThrottleLimit $throttle -Parallel {
+            ${function:Get-DirectoryStatistic} = $using:definition
+            Get-DirectoryStatistic -Path $_
+        }
+        foreach ($result in $results) { $map[$result.Path] = $result }
     }
 
-    $throttle = [Math]::Min($Path.Count, $script:config.MaxParallelism)
-    $definition = ${function:Get-DirectoryStatistic}.ToString()
-    $results = $Path | ForEach-Object -ThrottleLimit $throttle -Parallel {
-        ${function:Get-DirectoryStatistic} = $using:definition
-        Get-DirectoryStatistic -Path $_
-    }
-    foreach ($result in $results) { $map[$result.Path] = $result }
+    $timer.Stop()
+    $bytes = [int64](($map.Values | Measure-Object -Property SizeBytes -Sum).Sum ?? 0)
+    $files = [int](($map.Values | Measure-Object -Property FileCount -Sum).Sum ?? 0)
+    Write-LogEntry -Tag $Tag -Message ("sized $($map.Count) path(s) in $(Format-Duration -Elapsed $timer.Elapsed): " +
+        "$(Format-FileSize -Bytes $bytes) across $files file(s)")
     return $map
 }
 #endregion
@@ -983,34 +1025,41 @@ function Remove-ItemSafely {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Ignore
     if (-not $item) { return }
 
-    $knownSize = if ($Statistic) { [int64]$Statistic.SizeBytes } else { [int64]0 }
+    $blocked = if (-not (Test-PathSafe -Path $Path)) {
+        'blocked by the protected path policy'
+    }
+    elseif (-not $script:config.IncludeNetworkDrives -and (Test-IsNetworkPath -Path $Path)) {
+        'network path excluded'
+    }
+    else {
+        ''
+    }
 
-    if (-not (Test-PathSafe -Path $Path)) {
-        Add-SkippedFinding -Type $Type -Name $Name -Path $Path -SizeBytes $knownSize `
-            -Reason 'blocked by the protected path policy'
+    # Walking a tree that will not be touched buys nothing, so a refused path keeps whatever size the
+    # caller already measured and is never walked here.
+    if (-not $Statistic -and -not $blocked) { $Statistic = Get-DirectoryStatistic -Path $Path }
+    $sizeBytes = if ($Statistic) { [int64]$Statistic.SizeBytes } else { [int64]0 }
+    $fileCount = if ($Statistic) { [int]$Statistic.FileCount } else { 0 }
+
+    $detail = if ($sizeBytes -gt 0) { " ($(Format-FileSize -Bytes $sizeBytes))" } else { '' }
+    Write-LogEntry -Tag $Tag -Level Found -Message "found: $Path$detail"
+
+    if ($blocked) {
+        Write-LogEntry -Tag $Tag -Level Warn -Message "skipped: $Path - $blocked"
+        Add-SkippedFinding -Type $Type -Name $Name -Path $Path -SizeBytes $sizeBytes -Reason $blocked
         return
     }
 
-    if (-not $script:config.IncludeNetworkDrives -and (Test-IsNetworkPath -Path $Path)) {
-        Write-LogEntry -Tag $Tag -Level Warn -Message "skipped network path: $Path"
-        Add-SkippedFinding -Type $Type -Name $Name -Path $Path -SizeBytes $knownSize `
-            -Reason 'network path excluded'
-        return
-    }
-
-    if (-not $Statistic) { $Statistic = Get-DirectoryStatistic -Path $Path }
-    $finding = Add-Finding -Type $Type -Name $Name -Path $Path -SizeBytes $Statistic.SizeBytes
-
-    $detail = if ($Statistic.SizeBytes -gt 0) { " ($(Format-FileSize -Bytes $Statistic.SizeBytes))" } else { '' }
-    Write-LogEntry -Tag $Tag -Level Found -Message "found: $Name$detail"
+    $finding = Add-Finding -Type $Type -Name $Name -Path $Path -SizeBytes $sizeBytes
 
     if ($script:config.ScanOnly) { return }
     if (-not $PSCmdlet.ShouldProcess($Path, "Remove $Type")) { return }
 
-    if ($Statistic.FileCount -gt $script:config.LargeDirectoryThreshold) {
-        Write-LogEntry -Tag $Tag -Message "removing $($Statistic.FileCount) files; this may take a while"
+    if ($fileCount -gt $script:config.LargeDirectoryThreshold) {
+        Write-LogEntry -Tag $Tag -Message "removing $fileCount files$detail; this may take a while"
     }
 
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
             if ($item.PSIsContainer) {
@@ -1026,8 +1075,10 @@ function Remove-ItemSafely {
 
         if (-not $item.PSIsContainer -and $item.IsReadOnly) { $item.IsReadOnly = $false }
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        $timer.Stop()
         $finding.Status = 'Removed'
-        Write-LogEntry -Tag $Tag -Level Success -Message "removed: $Path"
+        $completion = Get-RemovalDetail -FileCount $fileCount -SizeBytes $sizeBytes -Elapsed $timer.Elapsed
+        Write-LogEntry -Tag $Tag -Level Success -Message "removed: $Path$completion"
     }
     catch [System.UnauthorizedAccessException] {
         if (-not (Clear-ReadOnlyAttribute -Path $Path)) {
@@ -1046,6 +1097,24 @@ function Remove-ItemSafely {
     catch {
         Write-RemovalFailure -Finding $finding -Tag $Tag -Target $Path -ErrorRecord $_
     }
+}
+
+function Get-RemovalDetail {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [int]$FileCount,
+
+        [Parameter(Mandatory)]
+        [int64]$SizeBytes,
+
+        [Parameter(Mandatory)]
+        [timespan]$Elapsed
+    )
+
+    if ($FileCount -le $script:config.LargeDirectoryThreshold) { return '' }
+    return " ($FileCount files, $(Format-FileSize -Bytes $SizeBytes) in $(Format-Duration -Elapsed $Elapsed))"
 }
 
 function Clear-ReadOnlyAttribute {
@@ -1081,14 +1150,18 @@ function Remove-FileSafely {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Ignore
     if (-not $item) { return }
 
+    $size = if ($item.PSIsContainer) { [int64]0 } else { [int64]$item.Length }
+    Write-LogEntry -Tag $Tag -Level Found -Message "found: $Path"
+
     if (-not (Test-PathSafe -Path $Path)) {
-        Add-SkippedFinding -Type $Type -Name $Name -Path $Path -Reason 'blocked by the protected path policy'
+        Write-LogEntry -Tag $Tag -Level Warn `
+            -Message "skipped: $Path - blocked by the protected path policy"
+        Add-SkippedFinding -Type $Type -Name $Name -Path $Path -SizeBytes $size `
+            -Reason 'blocked by the protected path policy'
         return
     }
 
-    $size = if ($item.PSIsContainer) { 0 } else { [int64]$item.Length }
     $finding = Add-Finding -Type $Type -Name $Name -Path $Path -SizeBytes $size
-    Write-LogEntry -Tag $Tag -Level Found -Message "found: $Name"
 
     if ($script:config.ScanOnly) { return }
     if (-not $PSCmdlet.ShouldProcess($Path, "Remove $Type")) { return }
@@ -1104,6 +1177,36 @@ function Remove-FileSafely {
     }
 }
 
+function Test-RegistryKeyPresent {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    # Test-Path costs roughly 350ms per missing key under HKLM:\SOFTWARE\Classes, which dominated the
+    # whole registry phase; the .NET call answers the same question for the same key set in under a
+    # millisecond. Anything this cannot resolve falls back to the provider rather than guessing.
+    $parts = $Path -split ':\\', 2
+    if ($parts.Count -ne 2) { return [bool](Test-Path -LiteralPath $Path) }
+
+    $hive = switch ($parts[0].ToUpperInvariant()) {
+        'HKCU' { [Microsoft.Win32.Registry]::CurrentUser }
+        'HKLM' { [Microsoft.Win32.Registry]::LocalMachine }
+        default { $null }
+    }
+    if (-not $hive) { return [bool](Test-Path -LiteralPath $Path) }
+
+    try {
+        $key = $hive.OpenSubKey($parts[1])
+    }
+    catch [System.Security.SecurityException] {
+        return [bool](Test-Path -LiteralPath $Path)
+    }
+
+    if (-not $key) { return $false }
+    $key.Dispose()
+    return $true
+}
+
 function Remove-RegistryKeySet {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1115,11 +1218,19 @@ function Remove-RegistryKeySet {
         [string]$Type,
 
         [Parameter(Mandatory)]
-        [string]$Tag
+        [string]$Tag,
+
+        [Parameter(Mandatory)]
+        [string]$GroupName
     )
 
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $present = 0
+    $removed = 0
+
     foreach ($key in $Path) {
-        if (-not (Test-Path -LiteralPath $key)) { continue }
+        if (-not (Test-RegistryKeyPresent -Path $key)) { continue }
+        $present++
 
         $finding = Add-Finding -Type $Type -Name $key -Path $key
         Write-LogEntry -Tag $Tag -Level Found -Message "found: $key"
@@ -1130,12 +1241,17 @@ function Remove-RegistryKeySet {
         try {
             Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction Stop
             $finding.Status = 'Removed'
+            $removed++
             Write-LogEntry -Tag $Tag -Level Success -Message "removed: $key"
         }
         catch {
             Write-RemovalFailure -Finding $finding -Tag $Tag -Target $key -ErrorRecord $_
         }
     }
+
+    $timer.Stop()
+    Write-LogEntry -Tag $Tag -Message ("$GroupName - checked $($Path.Count) key(s) in " +
+        "$(Format-Duration -Elapsed $timer.Elapsed): $present present, $removed removed")
 }
 #endregion
 
@@ -1173,7 +1289,10 @@ function Test-DiskSpace {
     [OutputType([bool])]
     param()
 
-    if ($script:config.SkipDiskCheck) { return $true }
+    if ($script:config.SkipDiskCheck) {
+        Write-LogEntry -Tag 'preflight' -Message 'disk space check disabled by -SkipDiskCheck'
+        return $true
+    }
 
     try {
         $drive = Get-PSDrive -Name $env:SystemDrive.TrimEnd(':') -PSProvider FileSystem -ErrorAction Stop
@@ -1198,14 +1317,22 @@ function New-RestorePoint {
     [CmdletBinding(SupportsShouldProcess)]
     param()
 
-    if ($script:config.SkipRestorePoint -or $script:config.ScanOnly) {
-        Write-LogEntry -Tag 'restore_point' -Level Warn -Message 'restore point creation disabled'
+    Write-Section -Tag 'restore_point' -Title 'SYSTEM RESTORE POINT'
+
+    if ($script:config.ScanOnly) {
+        Write-LogEntry -Tag 'restore_point' -Message 'scan only; no restore point is needed'
+        return
+    }
+    if ($script:config.SkipRestorePoint) {
+        Write-LogEntry -Tag 'restore_point' -Level Warn -Message 'restore point creation disabled by -SkipRestorePoint'
         return
     }
 
     if (-not $PSCmdlet.ShouldProcess($env:COMPUTERNAME, 'Create system restore point')) { return }
 
-    Write-LogEntry -Tag 'restore_point' -Message 'creating system restore point'
+    $description = "Python Removal v$($script:config.Version) - $([datetime]::Now.ToString('yyyy-MM-dd HH:mm'))"
+    Write-LogEntry -Tag 'restore_point' -Message "creating system restore point: $description"
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
 
     $enableArgs = @{ Drive = "$env:SystemDrive\"; WaitTillEnabled = $true }
     try {
@@ -1218,7 +1345,7 @@ function New-RestorePoint {
     }
 
     $createArgs = @{
-        Description      = "Python Removal v$($script:config.Version) - $([datetime]::Now.ToString('yyyy-MM-dd HH:mm'))"
+        Description      = $description
         RestorePointType = [uint32]12
         EventType        = [uint32]100
     }
@@ -1233,8 +1360,10 @@ function New-RestorePoint {
         return
     }
 
+    $timer.Stop()
     if ($result.ReturnValue -eq 0) {
-        Write-LogEntry -Tag 'restore_point' -Level Success -Message 'restore point created'
+        Write-LogEntry -Tag 'restore_point' -Level Success `
+            -Message "restore point created in $(Format-Duration -Elapsed $timer.Elapsed): $description"
         return
     }
 
@@ -1253,8 +1382,12 @@ function Test-RunningProcess {
     [CmdletBinding(SupportsShouldProcess)]
     param()
 
-    if ($script:config.SkipProcessCheck) { return }
     Write-Section -Tag 'process' -Title 'RUNNING PROCESSES'
+
+    if ($script:config.SkipProcessCheck) {
+        Write-LogEntry -Tag 'process' -Level Warn -Message 'process check disabled by -SkipProcessCheck'
+        return
+    }
 
     $running = @(Get-Process -ErrorAction Ignore | Where-Object {
             $_.ProcessName -match $script:pattern.ProcessName -and
@@ -1368,12 +1501,18 @@ function Get-PythonInstallation {
             if ($properties.DisplayName -notmatch $script:pattern.InstallInclude) { continue }
             if ($properties.DisplayName -match $script:pattern.InstallExclude) { continue }
 
+            # Burn bundles record only QuietUninstallString often enough that ignoring it strands an
+            # installation that is perfectly capable of uninstalling itself.
+            $command = $properties.UninstallString
+            if ([string]::IsNullOrWhiteSpace($command)) { $command = $properties.QuietUninstallString }
+
             [pscustomobject]@{
-                DisplayName     = $properties.DisplayName
-                InstallLocation = $properties.InstallLocation
-                UninstallString = $properties.UninstallString
-                RegistryPath    = $entry.PSPath
-                Scope           = $scope
+                DisplayName      = $properties.DisplayName
+                InstallLocation  = $properties.InstallLocation
+                UninstallString  = $command
+                WindowsInstaller = [bool]$properties.WindowsInstaller
+                RegistryPath     = (Join-Path $root $entry.PSChildName)
+                Scope            = $scope
             }
         }
     }
@@ -1413,8 +1552,9 @@ function Invoke-MsiUninstall {
 
     $lastExit = $null
     for ($attempt = 1; $attempt -le $script:config.MsiRetryCount; $attempt++) {
-        Write-LogEntry -Tag 'uninstall' `
-            -Message "msiexec /x $ProductCode (attempt $attempt/$($script:config.MsiRetryCount))"
+        Write-LogEntry -Tag 'uninstall' -Message ("msiexec /x $ProductCode for $DisplayName " +
+            "(attempt $attempt/$($script:config.MsiRetryCount))")
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
 
         try {
             $process = Start-Process -FilePath 'MsiExec.exe' `
@@ -1433,9 +1573,11 @@ function Invoke-MsiUninstall {
             return $false
         }
 
+        $timer.Stop()
         $lastExit = $process.ExitCode
         if ($lastExit -in @(0, 1605, 3010)) {
-            Write-LogEntry -Tag 'uninstall' -Level Success -Message "uninstalled: $DisplayName (exit $lastExit)"
+            Write-LogEntry -Tag 'uninstall' -Level Success `
+                -Message "uninstalled: $DisplayName (exit $lastExit in $(Format-Duration -Elapsed $timer.Elapsed))"
             return $true
         }
         if ($lastExit -ne 1618) { break }
@@ -1563,30 +1705,51 @@ function Uninstall-TraditionalPython {
 
     Write-Section -Tag 'uninstall' -Title 'TRADITIONAL INSTALLATIONS'
 
-    $installations = @(Get-PythonInstallation | Sort-Object DisplayName -Unique)
+    # Deduplicate on the registry path, not the name: two hives can register the same DisplayName for
+    # genuinely different products, and dropping one strands it.
+    $installations = @(Get-PythonInstallation | Sort-Object DisplayName, RegistryPath -Unique)
     if ($installations.Count -eq 0) {
         Write-LogEntry -Tag 'uninstall' -Message 'no registered Python installations found'
         return
     }
 
-    if (-not $script:config.ScanOnly) {
-        Write-LogEntry -Tag 'uninstall' `
-            -Message 'component dependency failures are expected; leftovers are cleared by the registry phase'
+    $msiCount = @($installations | Where-Object {
+            $_.UninstallString -match 'MsiExec' -and $_.UninstallString -match $script:pattern.MsiProductCode
+        }).Count
+
+    if (-not $script:config.ScanOnly -and $msiCount -gt 0) {
+        Write-LogEntry -Tag 'uninstall' -Message ("$msiCount Windows Installer component(s) to remove; " +
+            'dependency failures are expected and leftovers are cleared by the registry phase')
     }
 
     foreach ($installation in $installations) {
-        $finding = Add-Finding -Type 'Program' -Name $installation.DisplayName -Path $installation.InstallLocation
+        $location = if ([string]::IsNullOrWhiteSpace($installation.InstallLocation)) {
+            $installation.RegistryPath
+        }
+        else {
+            $installation.InstallLocation
+        }
+
+        $finding = Add-Finding -Type 'Program' -Name $installation.DisplayName -Path $location
         Write-LogEntry -Tag 'uninstall' -Level Found `
-            -Message "found: $($installation.DisplayName) [$($installation.Scope)]"
+            -Message "found: $($installation.DisplayName) [$($installation.Scope)] at $location"
 
         if ($script:config.ScanOnly) { continue }
 
         if ([string]::IsNullOrWhiteSpace($installation.UninstallString)) {
             $finding.Status = 'Skipped'
-            $finding.Reason = 'no uninstall command recorded'
-            Add-ManualAction -Item $installation.DisplayName -Reason 'no uninstall command recorded'
-            Write-LogEntry -Tag 'uninstall' -Level Warn `
-                -Message "no uninstall command recorded for $($installation.DisplayName)"
+
+            if (Test-InstallationPresent -Installation $installation) {
+                $finding.Reason = 'no uninstall command recorded'
+                Add-ManualAction -Item $installation.DisplayName -Reason 'no uninstall command recorded'
+                Write-LogEntry -Tag 'uninstall' -Level Warn `
+                    -Message "no uninstall command recorded for $($installation.DisplayName); remove it by hand"
+            }
+            else {
+                $finding.Reason = 'stub registration with no uninstall command; cleared by the registry phase'
+                Write-LogEntry -Tag 'uninstall' -Level Warn -Message ('stub registration with no uninstall ' +
+                    "command: $($installation.DisplayName); the registry phase will clear it")
+            }
             continue
         }
 
@@ -1680,10 +1843,12 @@ function Remove-EnvironmentVariable {
     if (-not $script:config.ScanOnly) { $null = Backup-EnvironmentVariable }
 
     $changed = $false
+    $found = 0
 
     foreach ($scope in 'User', 'Machine') {
         foreach ($name in $script:pythonVariable) {
             if (-not (Get-EnvironmentEntry -Scope $scope -Name $name)) { continue }
+            $found++
 
             $finding = Add-Finding -Type 'EnvironmentVariable' -Name "$name ($scope)" -Path $scope
             Write-LogEntry -Tag 'env_var' -Level Found -Message "found: $name ($scope)"
@@ -1703,6 +1868,11 @@ function Remove-EnvironmentVariable {
         }
     }
 
+    if ($found -eq 0) {
+        Write-LogEntry -Tag 'env_var' -Message ('no Python environment variables set ' +
+            "($($script:pythonVariable.Count) name(s) checked in both scopes)")
+    }
+
     if (Clear-PathVariable) { $changed = $true }
     if ($changed) { Send-SettingChange }
 }
@@ -1716,23 +1886,39 @@ function Clear-PathVariable {
 
     foreach ($scope in 'User', 'Machine') {
         $current = Get-EnvironmentEntry -Scope $scope -Name 'Path'
-        if (-not $current) { continue }
+        if (-not $current) {
+            Write-LogEntry -Tag 'path' -Message "$scope PATH is not set"
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($current.Value)) {
+            Write-LogEntry -Tag 'path' -Message "$scope PATH is empty"
+            continue
+        }
 
+        $segments = @($current.Value -split ';')
         $entries = @(Split-PathValue -Value $current.Value)
         $retained = @($entries | Where-Object { $_ -notmatch $script:pattern.PathEntry })
         $removedCount = $entries.Count - $retained.Count
-        $needsCompaction = $retained.Count -ne @($current.Value -split ';').Count
+        $emptyCount = $segments.Count - $entries.Count
 
-        if ($removedCount -eq 0 -and -not $needsCompaction) { continue }
+        if ($removedCount -eq 0 -and $emptyCount -eq 0) {
+            Write-LogEntry -Tag 'path' -Message ("$scope PATH is clean: $($entries.Count) entries, " +
+                "no Python references ($($current.Kind))")
+            continue
+        }
 
-        $finding = Add-Finding -Type 'Path' -Name "PATH ($scope): $removedCount entries" -Path $scope
-        $reason = if ($removedCount -gt 0) {
-            "$removedCount Python entr$(if ($removedCount -eq 1) { 'y' } else { 'ies' })"
-        }
-        else {
-            'empty segments only'
-        }
-        Write-LogEntry -Tag 'path' -Level Found -Message "$scope PATH needs rewriting: $reason"
+        $change = @(
+            if ($removedCount -gt 0) {
+                "$removedCount Python entr$(if ($removedCount -eq 1) { 'y' } else { 'ies' }) removed"
+            }
+            if ($emptyCount -gt 0) {
+                "$emptyCount empty segment$(if ($emptyCount -eq 1) { '' } else { 's' }) compacted"
+            }
+        ) -join ', '
+
+        $finding = Add-Finding -Type 'Path' -Name "PATH ($scope): $change" -Path $scope
+        Write-LogEntry -Tag 'path' -Level Found -Message ("$scope PATH needs rewriting: $change " +
+            "($($segments.Count) segments -> $($retained.Count) entries)")
 
         foreach ($entry in ($entries | Where-Object { $_ -match $script:pattern.PathEntry })) {
             Write-LogEntry -Tag 'path' -Message "removing entry: $entry"
@@ -1834,9 +2020,7 @@ function Remove-PythonDirectory {
         return
     }
 
-    Write-LogEntry -Tag 'directory' `
-        -Message "sizing $($matched.Count) directories across $($script:config.MaxParallelism) workers"
-    $statistics = Get-DirectoryStatisticSet -Path $matched.ToArray()
+    $statistics = Get-DirectoryStatisticSet -Path $matched.ToArray() -Tag 'directory'
 
     foreach ($path in $matched) {
         Remove-ItemSafely -Path $path -Name (Split-Path -Path $path -Leaf) `
@@ -1888,6 +2072,7 @@ function Remove-PythonTempFile {
     Write-Section -Tag 'temp_cache' -Title 'TEMPORARY FILES AND CACHES'
 
     $cutoff = [datetime]::Now.AddDays(-$script:config.TempFileMinimumAgeDays)
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $found = 0
 
     foreach ($location in $script:tempLocation) {
@@ -1902,10 +2087,15 @@ function Remove-PythonTempFile {
         }
     }
 
+    $timer.Stop()
     if ($found -eq 0) {
         Write-LogEntry -Tag 'temp_cache' `
             -Message "nothing to clear; items newer than $($script:config.TempFileMinimumAgeDays) day(s) are kept"
+        return
     }
+
+    Write-LogEntry -Tag 'temp_cache' `
+        -Message "processed $found item(s) in $(Format-Duration -Elapsed $timer.Elapsed)"
 }
 
 function Get-ScanRootDirectory {
@@ -1930,11 +2120,12 @@ function Remove-VirtualEnvironment {
     $exclusion = $script:pattern.ScanExclusion
     $topLevel = @(Get-ScanRootDirectory -Path $env:USERPROFILE)
 
-    Write-LogEntry -Tag 'venv' `
-        -Message "scanning $env:USERPROFILE to depth $($script:config.MaxScanDepth) across $($topLevel.Count) subtrees"
-
     $childDepth = $script:config.MaxScanDepth - 1
     $throttle = [Math]::Max(1, [Math]::Min($topLevel.Count, $script:config.MaxParallelism))
+
+    Write-LogEntry -Tag 'venv' -Message ("scanning $env:USERPROFILE to depth $($script:config.MaxScanDepth) " +
+        "across $($topLevel.Count) subtrees using $throttle worker(s)")
+    $scanTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
     $descendants = @()
     if ($topLevel.Count -gt 0) {
@@ -1948,7 +2139,9 @@ function Remove-VirtualEnvironment {
     }
 
     $candidates = @($topLevel.FullName) + $descendants
-    Write-LogEntry -Tag 'venv' -Message "scanned $($candidates.Count) directories"
+    $scanTimer.Stop()
+    Write-LogEntry -Tag 'venv' `
+        -Message "scanned $($candidates.Count) directories in $(Format-Duration -Elapsed $scanTimer.Elapsed)"
 
     $targets = [System.Collections.Generic.List[hashtable]]::new()
 
@@ -1989,7 +2182,7 @@ function Remove-VirtualEnvironment {
     $summary = $targets | Group-Object { $_.Type } | ForEach-Object { "$($_.Count) $($_.Name)" }
     Write-LogEntry -Tag 'venv' -Message "found $($targets.Count) environment(s): $($summary -join ', ')"
 
-    $statistics = Get-DirectoryStatisticSet -Path @($targets.Path)
+    $statistics = Get-DirectoryStatisticSet -Path @($targets.Path) -Tag 'venv'
     foreach ($target in $targets) {
         Remove-ItemSafely -Path $target.Path -Name $target.Name -Type $target.Type `
             -Tag 'venv' -Statistic $statistics[$target.Path]
@@ -2011,7 +2204,12 @@ function Remove-AppExecutionAlias {
     $found = 0
     foreach ($filter in @('python*.exe', 'pip*.exe')) {
         foreach ($alias in (Get-ChildItem -LiteralPath $aliasRoot -Filter $filter -File -ErrorAction Ignore)) {
-            if ($alias.Length -gt 1KB) { continue }
+            # A real executable that happens to live here is not an alias stub and is not ours to delete.
+            if ($alias.Length -gt 1KB) {
+                Write-LogEntry -Tag 'alias' -Level Warn -Message ('left in place, not an execution alias: ' +
+                    "$($alias.FullName) ($(Format-FileSize -Bytes $alias.Length))")
+                continue
+            }
             $found++
             Remove-FileSafely -Path $alias.FullName -Name $alias.Name -Type 'AppAlias' -Tag 'alias'
         }
@@ -2044,10 +2242,11 @@ function Clear-Registry {
 
     Write-Section -Tag 'registry' -Title 'REGISTRY CLEANUP'
 
-    Remove-RegistryKeySet -Path $script:coreRegistryKey -Type 'Registry' -Tag 'registry'
-    Remove-RegistryKeySet -Path $script:associationKey -Type 'FileAssociation' -Tag 'registry'
-    Remove-RegistryKeySet -Path $script:appPathKey -Type 'AppPath' -Tag 'registry'
-    Remove-RegistryKeySet -Path $script:userChoiceKey -Type 'UserChoice' -Tag 'registry'
+    Remove-RegistryKeySet -Path $script:coreRegistryKey -Type 'Registry' -Tag 'registry' -GroupName 'core keys'
+    Remove-RegistryKeySet -Path $script:associationKey -Type 'FileAssociation' -Tag 'registry' `
+        -GroupName 'file associations'
+    Remove-RegistryKeySet -Path $script:appPathKey -Type 'AppPath' -Tag 'registry' -GroupName 'application paths'
+    Remove-RegistryKeySet -Path $script:userChoiceKey -Type 'UserChoice' -Tag 'registry' -GroupName 'user choices'
 
     Clear-OrphanedUninstallEntry
     Clear-SharedDllReference
@@ -2064,8 +2263,12 @@ function Test-InstallationPresent {
 
     # Windows Installer owns its own registration, so an MSI entry with no install location cannot be
     # proven orphaned from here; treating it as present avoids stranding a still-registered product.
-    if ([string]::IsNullOrWhiteSpace($Installation.UninstallString)) { return $true }
+    if ($Installation.WindowsInstaller) { return $true }
     if ($Installation.UninstallString -match 'MsiExec') { return $true }
+
+    # No files are claimed, no installer owns the registration and no command could uninstall it, so
+    # the key is a stub the installer abandoned. Deleting it is the only cleanup available.
+    if ([string]::IsNullOrWhiteSpace($Installation.UninstallString)) { return $false }
 
     $executable = Get-UninstallExecutable -UninstallString $Installation.UninstallString
     if (-not $executable) { return $true }
@@ -2084,7 +2287,8 @@ function Clear-OrphanedUninstallEntry {
 
     foreach ($orphan in $orphans) {
         $finding = Add-Finding -Type 'OrphanedUninstall' -Name $orphan.DisplayName -Path $orphan.RegistryPath
-        Write-LogEntry -Tag 'registry' -Level Found -Message "found orphaned uninstall entry: $($orphan.DisplayName)"
+        Write-LogEntry -Tag 'registry' -Level Found `
+            -Message "found orphaned uninstall entry: $($orphan.DisplayName) at $($orphan.RegistryPath)"
 
         if ($script:config.ScanOnly) { continue }
         if (-not $PSCmdlet.ShouldProcess($orphan.RegistryPath, 'Remove orphaned uninstall entry')) { continue }
@@ -2263,7 +2467,19 @@ function Sync-ProcessPath {
 
     $combined = ($parts | Where-Object { $_ }) -join ';'
     $env:Path = [Environment]::ExpandEnvironmentVariables($combined)
-    Write-LogEntry -Tag 'verify' -Message 'refreshed the process PATH from the registry'
+    Write-LogEntry -Tag 'verify' `
+        -Message "refreshed the process PATH from the registry ($(@(Split-PathValue -Value $env:Path).Count) entries)"
+}
+
+function Test-PendingReboot {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    $sessionManager = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    $pending = (Get-ItemProperty -LiteralPath $sessionManager -Name 'PendingFileRenameOperations' `
+            -ErrorAction Ignore).PendingFileRenameOperations
+    return (@($pending).Count -gt 0)
 }
 
 function Test-PostRemoval {
@@ -2297,7 +2513,20 @@ function Test-PostRemoval {
         }
     }
 
-    $remainingKeys = @($script:verificationRegistryKey | Where-Object { Test-Path -LiteralPath $_ })
+    $remainingInstallation = @(Get-PythonInstallation | Sort-Object DisplayName, RegistryPath -Unique)
+    if ($remainingInstallation.Count -eq 0) {
+        Write-LogEntry -Tag 'verify' -Level Success -Message 'no Python installations remain registered'
+    }
+    else {
+        foreach ($installation in $remainingInstallation) {
+            $script:state.VerificationIssue.Add(
+                "installation still registered: $($installation.DisplayName) ($($installation.RegistryPath))")
+            Write-LogEntry -Tag 'verify' -Level Error `
+                -Message "installation still registered: $($installation.DisplayName) - $($installation.RegistryPath)"
+        }
+    }
+
+    $remainingKeys = @($script:verificationRegistryKey | Where-Object { Test-RegistryKeyPresent -Path $_ })
     if ($remainingKeys.Count -eq 0) {
         Write-LogEntry -Tag 'verify' -Level Success `
             -Message "no registry keys remain ($(@($script:verificationRegistryKey).Count) checked)"
@@ -2360,7 +2589,10 @@ function New-Report {
     [CmdletBinding(SupportsShouldProcess)]
     param()
 
-    if ($script:state.Findings.Count -eq 0) { return }
+    if ($script:state.Findings.Count -eq 0) {
+        Write-LogEntry -Tag 'report' -Message 'no findings recorded; no CSV report written'
+        return
+    }
     if (-not $PSCmdlet.ShouldProcess($script:config.ReportFile, 'Write CSV report')) { return }
 
     try {
@@ -2502,7 +2734,9 @@ function Write-MarkdownReport {
             "| **Manual Action** | **$actionCount item(s)** - see ``## Manual Action Required`` |")
     }
     [void]$builder.AppendLine("| Text Log | ``$($script:config.LogFile)`` |")
-    [void]$builder.AppendLine("| CSV Report | ``$($script:config.ReportFile)`` |")
+    if (Test-Path -LiteralPath $script:config.ReportFile) {
+        [void]$builder.AppendLine("| CSV Report | ``$($script:config.ReportFile)`` |")
+    }
     if (Test-Path -LiteralPath $script:config.BackupFile) {
         [void]$builder.AppendLine("| Environment Backup | ``$($script:config.BackupFile)`` |")
         [void]$builder.AppendLine('| Undo Command | `.\RemovePython.ps1 -RestoreEnvironment <backup>` |')
@@ -2651,10 +2885,11 @@ function Write-MarkdownReport {
         # -WhatIf would silently skip the report in the mode it is most useful for.
         [System.IO.File]::WriteAllText(
             $script:config.MarkdownFile, $builder.ToString(), [System.Text.UTF8Encoding]::new($false))
-        Write-Information "[report] review written: $($script:config.MarkdownFile)"
+        Write-LogEntry -Tag 'report' -Level Success -Message "review written: $($script:config.MarkdownFile)"
     }
     catch {
-        Write-Warning "[report] review write failed: $($_.Exception.GetType().Name): $($_.Exception.Message)"
+        Write-LogEntry -Tag 'report' -Level Error `
+            -Message "review write failed: $($_.Exception.GetType().Name): $($_.Exception.Message)"
     }
 }
 
@@ -2709,8 +2944,10 @@ function Write-Summary {
     Write-LogEntry -Tag 'main' -Level $skippedLevel -Message "items skipped: $skipped"
 
     if ($removed + $failed -gt 0) {
-        $rate = [Math]::Round(($removed / ($removed + $failed)) * 100, 1)
-        Write-LogEntry -Tag 'main' -Message "success rate: $rate%"
+        $attempted = $removed + $failed
+        $rate = [Math]::Round(($removed / $attempted) * 100, 1)
+        Write-LogEntry -Tag 'main' `
+            -Message "success rate: $rate% ($removed of $attempted attempted; $skipped never attempted)"
     }
 
     $skippedSize = Get-FindingSize -Status 'Skipped'
@@ -2725,8 +2962,17 @@ function Write-Summary {
         Write-LogEntry -Tag 'main' -Message "size left in place by skips: $(Format-FileSize -Bytes $skippedSize)"
     }
 
-    $elapsed = [Math]::Round(([datetime]::Now - $script:state.StartTime).TotalSeconds, 1)
-    Write-LogEntry -Tag 'main' -Message "elapsed: ${elapsed}s"
+    if ($script:state.BlockedPath.Count -gt 0) {
+        Write-LogEntry -Tag 'main' -Level Warn `
+            -Message "paths refused by the safety gate: $($script:state.BlockedPath.Count)"
+    }
+    if ($script:state.ManualAction.Count -gt 0) {
+        Write-LogEntry -Tag 'main' -Level Warn `
+            -Message "manual action required for $($script:state.ManualAction.Count) item(s); see the review file"
+    }
+
+    Write-LogEntry -Tag 'main' `
+        -Message "elapsed: $(Format-Duration -Elapsed ([datetime]::Now - $script:state.StartTime))"
     Write-LogEntry -Tag 'main' -Message "log file: $($script:config.LogFile)"
     Write-LogEntry -Tag 'main' -Message "review file: $($script:config.MarkdownFile)"
 }
@@ -2767,13 +3013,16 @@ function Confirm-Removal {
         Write-LogEntry -Tag 'main' -Message 'a system restore point will be created first'
     }
 
+    Write-LogEntry -Tag 'main' -Level Warn -Message 'waiting for confirmation: continue? [Y]es / [N]o'
     $Host.UI.Write("`n[main] continue? [Y]es / [N]o: ")
     $answer = Read-Host
 
     if ($answer -notmatch '^[Yy]') {
-        Write-LogEntry -Tag 'main' -Level Warn -Message 'cancelled at the confirmation prompt'
+        Write-LogEntry -Tag 'main' -Level Warn -Message "cancelled at the confirmation prompt (answer: '$answer')"
         return $false
     }
+
+    Write-LogEntry -Tag 'main' -Level Success -Message "confirmed at the prompt (answer: '$answer')"
     return $true
 }
 #endregion
@@ -2795,6 +3044,18 @@ try {
 
     Write-LogEntry -Tag 'main' -Level Section -Message "=== PYTHON REMOVAL v$($script:config.Version) ==="
 
+    if ($script:state.LogFallbackFrom) {
+        Write-LogEntry -Tag 'main' -Level Warn -Message ('log directory is not writable, artefacts redirected: ' +
+            "$($script:state.LogFallbackFrom) -> $($script:config.LogDirectory)")
+    }
+    Write-LogEntry -Tag 'main' -Message "mode: $(Get-RunMode); artefact directory: $($script:config.LogDirectory)"
+    Write-LogEntry -Tag 'main' -Message ("options: force=$($script:config.Force), " +
+        "restore point=$(-not $script:config.SkipRestorePoint), " +
+        "process check=$(-not $script:config.SkipProcessCheck), " +
+        "disk check=$(-not $script:config.SkipDiskCheck), " +
+        "network drives=$($script:config.IncludeNetworkDrives), scan depth=$($script:config.MaxScanDepth), " +
+        "parallelism=$($script:config.MaxParallelism), uninstaller timeout=$($script:config.TimeoutSeconds)s")
+
     if ($PSCmdlet.ParameterSetName -eq 'Restore') {
         $script:config.RestoreMode = $true
         $script:state.ExitCode = if (Restore-EnvironmentVariable -BackupPath $RestoreEnvironment) { 0 } else { 1 }
@@ -2806,7 +3067,10 @@ try {
         exit 5
     }
 
-    $null = Test-DiskSpace
+    if (-not (Test-DiskSpace) -and -not $script:config.SkipRestorePoint -and -not $script:config.ScanOnly) {
+        Write-LogEntry -Tag 'preflight' -Level Warn `
+            -Message 'restore point creation is likely to fail with this little free space'
+    }
 
     if (-not (Confirm-Removal)) {
         $script:state.ExitCode = 4
@@ -2840,11 +3104,14 @@ try {
         & $phase.Value
         $phaseTimer.Stop()
 
+        $phaseFindings = $script:state.Findings.Count - $findingsBefore
         [void]$script:state.PhaseTiming.Add([pscustomobject]@{
                 Name     = $phase.Key
                 Seconds  = [Math]::Round($phaseTimer.Elapsed.TotalSeconds, 2)
-                Findings = $script:state.Findings.Count - $findingsBefore
+                Findings = $phaseFindings
             })
+        Write-LogEntry -Tag 'main' -Message ("phase '$($phase.Key)' completed in " +
+            "$(Format-Duration -Elapsed $phaseTimer.Elapsed) with $phaseFindings finding(s)")
         $index++
     }
     Write-Progress -Activity 'Python removal' -Completed
@@ -2859,7 +3126,20 @@ try {
     Write-LogEntry -Tag 'main' -Level Success -Message "$mode complete (exit code $($script:state.ExitCode))"
 
     if (-not $script:config.ScanOnly) {
-        Write-LogEntry -Tag 'main' -Level Warn -Message 'reboot to finish removing files that were in use'
+        $terminated = @($script:state.Findings |
+                Where-Object { $_.Type -eq 'Process' -and $_.Status -eq 'Removed' }).Count
+        $rebootReason = @(
+            if ((Get-FindingCount -Status 'Failed') -gt 0) { 'one or more removals failed' }
+            if ($terminated -gt 0) { "$terminated Python process(es) were terminated" }
+            if (Test-PendingReboot) { 'Windows has queued file rename operations' }
+        )
+
+        if ($rebootReason.Count -gt 0) {
+            Write-LogEntry -Tag 'main' -Level Warn -Message "reboot recommended: $($rebootReason -join '; ')"
+        }
+        else {
+            Write-LogEntry -Tag 'main' -Message 'no reboot required'
+        }
     }
 
     exit $script:state.ExitCode

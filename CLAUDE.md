@@ -16,8 +16,8 @@ types, 6 PowerShell profiles, the Windows Python Launcher binaries)
 
 ```
 RemovePython/
-├── RemovePython.ps1              # Main script (~2400 lines, 61 functions)
-├── RemovePython.Tests.ps1        # Pester suite (~1580 lines, 276 tests)
+├── RemovePython.ps1              # Main script (~3160 lines, 74 functions)
+├── RemovePython.Tests.ps1        # Pester suite (~2150 lines, 348 tests)
 ├── Run-RemovePython.bat          # Launcher with auto-elevation and exit-code propagation
 ├── PSScriptAnalyzerSettings.psd1 # Lint configuration; the quality gate for this repo
 ├── CLAUDE.md                     # This file
@@ -134,13 +134,24 @@ the verb or outcome (`found: <x>`, `removed: <x>`, `remove failed: <x> - <type>:
 
 `Initialize-Configuration` populates all script-scoped state, then:
 
-1. Open the log file (falls back to `$env:TEMP` when the log directory is not writable).
+1. Open the log file. When the log directory is not writable the run falls back to `$env:TEMP` and
+   **moves the review, CSV and backup with it** — leaving them behind would put the log in one
+   directory while every other artefact failed to write in the directory that was just refused. The
+   redirection is recorded in `$script:state.LogFallbackFrom` and warned about after the banner.
 2. `-RestoreEnvironment` short-circuits to `Restore-EnvironmentVariable` and exits.
 3. `Test-RequiredEnvironment` — hard fails with exit 5 if a required variable is empty.
-4. `Test-DiskSpace`, then `Confirm-Removal` unless `-Force`, `-ScanOnly` or `-WhatIf`.
+4. `Test-DiskSpace`, whose result warns that restore point creation is likely to fail, then
+   `Confirm-Removal` unless `-Force`, `-ScanOnly` or `-WhatIf`.
 5. Fourteen phases run in order behind a progress bar (see below).
 6. `Test-PostRemoval` (skipped for `-ScanOnly` and `-WhatIf`), `New-Report`, `Write-Summary`.
 7. `Get-RunExitCode` determines the exit status.
+8. A reboot is advised only on evidence — a failed removal, a terminated process, or a queued
+   `PendingFileRenameOperations`. Advising one unconditionally trains the reader to ignore it.
+
+`Test-PostRemoval` checks registered installations, `python`/`py` on PATH, the launcher binaries,
+registry keys, environment variables and install directories. The installation check is what turns a
+surviving Add/Remove Programs entry into exit code 3; without it a run can report "the system is
+Python-free" while Python is still listed in Programs and Features.
 
 ### Phases
 
@@ -154,6 +165,17 @@ Because Documents is protected, the four per-user PowerShell profile locations
 (`Documents\PowerShell` and `Documents\WindowsPowerShell`) are reported as `Skipped` rather than
 edited. Only the two machine-wide profiles under `%ProgramFiles%\PowerShell\7` are still in scope.
 Virtual environments found beneath Documents are likewise reported and skipped, never removed.
+
+Every phase opens with `Write-Section` before it checks whether it is disabled, so a skipped phase
+still appears in the log rather than vanishing from it, and closes with a `[main] phase '<name>'
+completed in <duration> with <n> finding(s)` line. A phase that costs minutes is visible in the log
+itself, not only in the review report's timing table.
+
+Uninstalling and orphan-sweeping are two halves of one job, split across the `Installations` and
+`Registry` phases. An Add/Remove Programs entry with nothing to run is *not* a manual action: it is
+recorded `Skipped` with a reason naming the registry phase, and `Clear-OrphanedUninstallEntry` then
+deletes the key. Raising a manual action there instead strands the entry, because nothing else in the
+run removes it and `Test-PostRemoval` used not to look.
 
 ### Key functions
 
@@ -172,7 +194,11 @@ Virtual environments found beneath Documents are likewise reported and skipped, 
 | `Send-SettingChange` | Broadcasts `WM_SETTINGCHANGE` | Registry writes are otherwise invisible to running processes |
 | `Backup-EnvironmentVariable` / `Restore-EnvironmentVariable` | Environment backup and replay | Backup records the value kind per entry |
 | `Test-UninstallerTrust` | Authenticode check before running a vendor uninstaller | Refuses unsigned executables recorded under HKCU, which is writable without elevation |
-| `Test-InstallationPresent` | Orphan detection | Reports *present* when it cannot prove otherwise, so a still-registered MSI product is never stranded |
+| `Test-InstallationPresent` | Orphan detection | Reports *present* when Windows Installer owns the registration, so a live MSI product is never stranded. An entry with no install location, no uninstall command and no `WindowsInstaller` flag is a stub and is reported orphaned — nothing can uninstall it, so deleting the key is the only cleanup there is |
+| `Test-RegistryKeyPresent` | Registry existence test | `Test-Path` costs ~350ms per *missing* key under `HKLM:\SOFTWARE\Classes`, which was the whole cost of the registry phase; the .NET call answers identically in under a millisecond. Falls back to the provider for anything it cannot resolve |
+| `Test-PendingReboot` | Reads `PendingFileRenameOperations` | The run only advises a reboot on evidence |
+| `Format-Duration` | `12.4s` / `2m 1.6s` | Rounds before splitting; `[int]` on total minutes rounds *up*, which rendered 119.99s as `2m 60s` |
+| `Get-RemovalDetail` | File count, size and elapsed for a large removal | Empty below `LargeDirectoryThreshold`, so small deletions stay quiet |
 | `Sync-ProcessPath` | Rebuilds `$env:Path` from the registry before verification | Without it, verification reads the stale launch-time PATH and reports false failures |
 | `Write-MarkdownReport` | Builds the review report | Called from `finally`, so it survives a crash and runs under `-WhatIf`. Uses `Write-` rather than `New-` deliberately: a `New-` verb would demand `SupportsShouldProcess`, which would suppress the report in exactly the preview mode it is most useful for |
 | `ConvertTo-MarkdownCell` | Escapes and truncates a table cell | Pipes and newlines in a program name or exception message would otherwise break the table |
@@ -245,7 +271,7 @@ environment variable; never concatenate a literal user path.
 ## Testing
 
 ```powershell
-Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1   # must return nothing
+Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1 -ErrorAction Stop
 Invoke-Formatter -ScriptDefinition (Get-Content ./RemovePython.ps1 -Raw) -Settings ./PSScriptAnalyzerSettings.psd1
 Invoke-Pester -Path ./RemovePython.Tests.ps1
 .\RemovePython.ps1 -ScanOnly
@@ -253,6 +279,12 @@ Invoke-Pester -Path ./RemovePython.Tests.ps1
 
 The settings file is the gate, not the default rule set. `Invoke-ScriptAnalyzer` without `-Settings`
 skips the opt-in formatting rules and reports a clean file that is not.
+
+`-ErrorAction Stop` is not optional. PSScriptAnalyzer 1.25.0 fails in roughly half of fresh sessions
+with `NullReferenceException` or `The term 'Get-Command' is not recognized`, its rule runspaces
+having started without the default modules. **A failed run emits no findings**, so empty output alone
+does not mean clean — the run must also not have raised. Re-run until one completes; the flakiness is
+per-session and unrelated to the code under analysis.
 
 The suite loads functions out of `RemovePython.ps1` by AST parsing and calls
 `Initialize-Configuration`, so it never executes the script and never duplicates its data. Tests

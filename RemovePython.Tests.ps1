@@ -300,6 +300,34 @@ Describe 'Safety: Remove-ItemSafely' -Tag 'Safety', 'Critical' {
                 -Type 'Directory' -Tag 'directory'
             $script:state.Findings.Count | Should -Be 0
         }
+
+        # A skipped finding whose size reads 0 B understates what the policy left on disk, which is the
+        # one number the review report exists to show.
+        It 'Carries the measured size onto a blocked finding' {
+            $statistic = [pscustomobject]@{
+                Path      = (Join-Path $env:WINDIR 'System32')
+                SizeBytes = [int64]8795649452
+                FileCount = 4200
+            }
+
+            Remove-ItemSafely -Path (Join-Path $env:WINDIR 'System32') -Name 'system32' `
+                -Type 'Directory' -Tag 'directory' -Statistic $statistic
+
+            $skipped = @($script:state.Findings | Where-Object { $_.Status -eq 'Skipped' })
+            $skipped.Count | Should -Be 1
+            $skipped[0].SizeBytes | Should -Be 8795649452
+            $skipped[0].Reason | Should -Be 'blocked by the protected path policy'
+        }
+
+        It 'Records a blocked path against the safety gate ledger' {
+            $script:state.BlockedPath.Clear()
+
+            Remove-ItemSafely -Path (Join-Path $env:WINDIR 'System32') -Name 'system32' `
+                -Type 'Directory' -Tag 'directory'
+
+            $script:state.BlockedPath.Count | Should -Be 1
+            $script:state.BlockedPath[0].Reason | Should -BeLike 'protected location:*'
+        }
     }
 
     Context 'Preview mode' {
@@ -428,7 +456,7 @@ Describe 'Removal primitives' -Tag 'Removal' {
             $key = "$($script:scratchRegistryKey)\Target"
             $null = New-Item -Path $key -Force
 
-            Remove-RegistryKeySet -Path @($key) -Type 'Registry' -Tag 'registry'
+            Remove-RegistryKeySet -Path @($key) -Type 'Registry' -Tag 'registry' -GroupName 'scratch'
 
             Test-Path -LiteralPath $key | Should -BeFalse
             Get-FindingCount -Status 'Removed' | Should -Be 1
@@ -438,18 +466,20 @@ Describe 'Removal primitives' -Tag 'Removal' {
             $key = "$($script:scratchRegistryKey)\Parent"
             $null = New-Item -Path "$key\Child\Grandchild" -Force
 
-            Remove-RegistryKeySet -Path @($key) -Type 'Registry' -Tag 'registry'
+            Remove-RegistryKeySet -Path @($key) -Type 'Registry' -Tag 'registry' -GroupName 'scratch'
 
             Test-Path -LiteralPath $key | Should -BeFalse
         }
 
         It 'Ignores keys that do not exist' {
-            Remove-RegistryKeySet -Path @('HKCU:\Software\RemovePythonAbsentKey') -Type 'Registry' -Tag 'registry'
+            Remove-RegistryKeySet -Path @('HKCU:\Software\RemovePythonAbsentKey') -Type 'Registry' `
+                -Tag 'registry' -GroupName 'scratch'
             $script:state.Findings.Count | Should -Be 0
         }
 
         It 'Accepts an empty collection' {
-            { Remove-RegistryKeySet -Path @() -Type 'Registry' -Tag 'registry' } | Should -Not -Throw
+            { Remove-RegistryKeySet -Path @() -Type 'Registry' -Tag 'registry' -GroupName 'scratch' } |
+                Should -Not -Throw
         }
 
         It 'Leaves the key in place in preview mode' {
@@ -457,10 +487,44 @@ Describe 'Removal primitives' -Tag 'Removal' {
             $null = New-Item -Path $key -Force
             $script:config.ScanOnly = $true
 
-            Remove-RegistryKeySet -Path @($key) -Type 'Registry' -Tag 'registry'
+            Remove-RegistryKeySet -Path @($key) -Type 'Registry' -Tag 'registry' -GroupName 'scratch'
 
             Test-Path -LiteralPath $key | Should -BeTrue
             Get-FindingCount -Status 'Found' | Should -Be 1
+        }
+    }
+
+    Context 'Test-RegistryKeyPresent' {
+
+        It 'Finds an existing HKCU key' {
+            $key = "$($script:scratchRegistryKey)\Present"
+            $null = New-Item -Path $key -Force
+            Test-RegistryKeyPresent -Path $key | Should -BeTrue
+        }
+
+        It 'Reports a missing key as absent' {
+            Test-RegistryKeyPresent -Path "$($script:scratchRegistryKey)\NotThere" | Should -BeFalse
+        }
+
+        It 'Reads the HKLM hive' {
+            Test-RegistryKeyPresent -Path 'HKLM:\SOFTWARE\Microsoft' | Should -BeTrue
+            Test-RegistryKeyPresent -Path 'HKLM:\SOFTWARE\RemovePythonDefinitelyAbsent' | Should -BeFalse
+        }
+
+        # The fast path must never disagree with the provider, or the registry phase would either skip
+        # a key that is really there or try to delete one that is not.
+        It 'Agrees with the provider across every configured key' {
+            $keys = $script:coreRegistryKey + $script:associationKey +
+            $script:appPathKey + $script:userChoiceKey
+
+            foreach ($key in $keys) {
+                Test-RegistryKeyPresent -Path $key |
+                    Should -Be ([bool](Test-Path -LiteralPath $key)) -Because "they must agree on $key"
+            }
+        }
+
+        It 'Falls back to the provider for an unrecognised prefix' {
+            Test-RegistryKeyPresent -Path 'HKCR:\NoSuchDriveHere' | Should -BeFalse
         }
     }
 
@@ -718,10 +782,13 @@ Describe 'Environment variable handling' -Tag 'Environment', 'Critical' {
             { Remove-EnvironmentEntry -Scope User -Name 'REMOVEPYTHON_DEFINITELY_ABSENT' } | Should -Not -Throw
         }
 
-        It 'Reads the machine PATH as an expandable value' {
+        # Asserting the machine PATH is REG_EXPAND_SZ tests how Windows happens to be configured, not
+        # this script; a host whose PATH some other tool already flattened would fail it forever.
+        It 'Reads the machine PATH and reports whichever kind it is stored as' {
             $entry = Get-EnvironmentEntry -Scope Machine -Name 'Path'
             $entry | Should -Not -BeNullOrEmpty
-            $entry.Kind | Should -Be 'ExpandString'
+            $entry.Value | Should -Not -BeNullOrEmpty
+            $entry.Kind | Should -BeIn @('String', 'ExpandString')
         }
     }
 
@@ -928,9 +995,24 @@ Describe 'Uninstall command parsing' -Tag 'Uninstall' {
             Test-InstallationPresent -Installation $installation | Should -BeTrue
         }
 
-        It 'Reports present when the entry cannot be evaluated at all' {
-            $installation = [pscustomobject]@{ InstallLocation = ''; UninstallString = '' }
+        It 'Reports present for a Windows Installer entry that records no uninstall command' {
+            $installation = [pscustomobject]@{
+                InstallLocation  = ''
+                UninstallString  = ''
+                WindowsInstaller = $true
+            }
             Test-InstallationPresent -Installation $installation | Should -BeTrue
+        }
+
+        # A key claiming no files, owned by no installer and carrying no command cannot be uninstalled
+        # by any means. Calling it present strands it in Add/Remove Programs forever.
+        It 'Reports orphaned for a stub entry with no location, no command and no installer' {
+            $installation = [pscustomobject]@{
+                InstallLocation  = ''
+                UninstallString  = ''
+                WindowsInstaller = $false
+            }
+            Test-InstallationPresent -Installation $installation | Should -BeFalse
         }
 
         It 'Reports orphaned when the uninstaller executable is missing' {
@@ -949,6 +1031,78 @@ Describe 'Uninstall command parsing' -Tag 'Uninstall' {
                 UninstallString = "`"$exe`" /S"
             }
             Test-InstallationPresent -Installation $installation | Should -BeTrue
+        }
+    }
+
+    Context 'Get-PythonInstallation' {
+
+        BeforeAll {
+            $script:realUninstallRoot = $script:uninstallRoot
+            $script:fakeUninstallRoot = "$($script:scratchRegistryKey)\Uninstall"
+            $script:uninstallRoot = @($script:fakeUninstallRoot)
+        }
+
+        AfterAll {
+            $script:uninstallRoot = $script:realUninstallRoot
+            if (Test-Path -LiteralPath $script:fakeUninstallRoot) {
+                Remove-Item -LiteralPath $script:fakeUninstallRoot -Recurse -Force
+            }
+        }
+
+        BeforeEach {
+            if (Test-Path -LiteralPath $script:fakeUninstallRoot) {
+                Remove-Item -LiteralPath $script:fakeUninstallRoot -Recurse -Force
+            }
+            $null = New-Item -Path $script:fakeUninstallRoot -Force
+        }
+
+        It 'Falls back to QuietUninstallString when UninstallString is absent' {
+            $key = "$($script:fakeUninstallRoot)\{quiet}"
+            $null = New-Item -Path $key -Force
+            Set-ItemProperty -LiteralPath $key -Name 'DisplayName' -Value 'Python 3.14.3 (64-bit)'
+            Set-ItemProperty -LiteralPath $key -Name 'QuietUninstallString' -Value '"C:\b.exe" /uninstall /quiet'
+
+            $found = @(Get-PythonInstallation)
+            $found.Count | Should -Be 1
+            $found[0].UninstallString | Should -Be '"C:\b.exe" /uninstall /quiet'
+        }
+
+        It 'Reports a drive-qualified registry path that Remove-Item accepts' {
+            $key = "$($script:fakeUninstallRoot)\{pathform}"
+            $null = New-Item -Path $key -Force
+            Set-ItemProperty -LiteralPath $key -Name 'DisplayName' -Value 'Python 3.14.3 (64-bit)'
+
+            $found = @(Get-PythonInstallation)
+            $found[0].RegistryPath | Should -Be $key
+            Test-Path -LiteralPath $found[0].RegistryPath | Should -BeTrue
+        }
+
+        It 'Flags a Windows Installer registration' {
+            $key = "$($script:fakeUninstallRoot)\{msi}"
+            $null = New-Item -Path $key -Force
+            Set-ItemProperty -LiteralPath $key -Name 'DisplayName' -Value 'Python 3.14.3 Core Interpreter'
+            Set-ItemProperty -LiteralPath $key -Name 'WindowsInstaller' -Value 1 -Type DWord
+
+            (@(Get-PythonInstallation))[0].WindowsInstaller | Should -BeTrue
+        }
+
+        # The run of 2026-08-08 left exactly this key behind: a bundle stub with nothing to run.
+        It 'Surfaces a bare stub entry as an orphan the registry phase can clear' {
+            $key = "$($script:fakeUninstallRoot)\{stub}"
+            $null = New-Item -Path $key -Force
+            Set-ItemProperty -LiteralPath $key -Name 'DisplayName' -Value 'Python 3.14.3 (64-bit)'
+
+            $found = @(Get-PythonInstallation)
+            $found.Count | Should -Be 1
+            Test-InstallationPresent -Installation $found[0] | Should -BeFalse
+        }
+
+        It 'Keeps honouring the exclusion pattern' {
+            $key = "$($script:fakeUninstallRoot)\{ide}"
+            $null = New-Item -Path $key -Force
+            Set-ItemProperty -LiteralPath $key -Name 'DisplayName' -Value 'PyCharm Community Edition'
+
+            @(Get-PythonInstallation).Count | Should -Be 0
         }
     }
 }
@@ -976,6 +1130,58 @@ Describe 'Utility functions' -Tag 'Utilities' {
 
         It 'Caps the unit at terabytes' {
             Format-FileSize -Bytes ([int64]1099511627776 * 5000) | Should -BeLike '* TB'
+        }
+    }
+
+    Context 'Format-Duration' {
+
+        It 'Renders a sub-minute span in seconds' {
+            Format-Duration -Elapsed ([timespan]::FromSeconds(19.74)) | Should -Be '19.7s'
+        }
+
+        It 'Renders a zero span' {
+            Format-Duration -Elapsed ([timespan]::Zero) | Should -Be '0s'
+        }
+
+        It 'Splits a span of a minute or more into minutes and seconds' {
+            Format-Duration -Elapsed ([timespan]::FromSeconds(121.6)) | Should -Be '2m 1.6s'
+        }
+
+        It 'Does not report sixty seconds' {
+            Format-Duration -Elapsed ([timespan]::FromSeconds(119.99)) | Should -Be '2m 0s'
+        }
+
+        It 'Rolls a sub-minute span that rounds up to a full minute' {
+            Format-Duration -Elapsed ([timespan]::FromSeconds(59.96)) | Should -Be '1m 0s'
+        }
+
+        It 'Renders exactly one minute' {
+            Format-Duration -Elapsed ([timespan]::FromMinutes(1)) | Should -Be '1m 0s'
+        }
+    }
+
+    Context 'Get-RemovalDetail' {
+
+        It 'Stays silent for a small removal' {
+            Get-RemovalDetail -FileCount 10 -SizeBytes 2048 -Elapsed ([timespan]::FromSeconds(1)) |
+                Should -BeExactly ''
+        }
+
+        It 'Reports count, size and duration once past the large-directory threshold' {
+            $detail = Get-RemovalDetail -FileCount 578321 -SizeBytes 67339851678 `
+                -Elapsed ([timespan]::FromSeconds(121.6))
+
+            $detail | Should -BeLike '*578321 files*'
+            $detail | Should -BeLike '*62.72 GB*'
+            $detail | Should -BeLike '*2m 1.6s*'
+        }
+    }
+
+    Context 'Test-PendingReboot' {
+
+        It 'Answers without throwing and returns a boolean' {
+            $result = Test-PendingReboot
+            $result | Should -BeOfType [bool]
         }
     }
 
@@ -1099,7 +1305,7 @@ Describe 'Utility functions' -Tag 'Utilities' {
     Context 'Get-DirectoryStatisticSet' {
 
         It 'Returns an empty map for an empty collection' {
-            (Get-DirectoryStatisticSet -Path @()).Count | Should -Be 0
+            (Get-DirectoryStatisticSet -Path @() -Tag 'directory').Count | Should -Be 0
         }
 
         It 'Measures a single path without spawning runspaces' {
@@ -1107,7 +1313,7 @@ Describe 'Utility functions' -Tag 'Utilities' {
             $null = New-Item -Path $root -ItemType Directory -Force
             Set-Content -LiteralPath (Join-Path $root 'f.txt') -Value ('x' * 10) -NoNewline
 
-            $map = Get-DirectoryStatisticSet -Path @($root)
+            $map = Get-DirectoryStatisticSet -Path @($root) -Tag 'directory'
             $map[$root].SizeBytes | Should -Be 10
         }
 
@@ -1119,7 +1325,7 @@ Describe 'Utility functions' -Tag 'Utilities' {
                 $path
             }
 
-            $map = Get-DirectoryStatisticSet -Path $roots
+            $map = Get-DirectoryStatisticSet -Path $roots -Tag 'directory'
             $map.Count | Should -Be 3
             foreach ($root in $roots) { $map[$root].SizeBytes | Should -Be 20 }
         }

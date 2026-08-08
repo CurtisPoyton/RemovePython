@@ -41,7 +41,10 @@ Run-RemovePython.bat             # launcher; elevates automatically
 - **Environments** — venv, conda, Poetry, Pipenv
 - **Caches** — pip, UV, and temporary files older than one day
 - **Registry** — installation keys, file associations, ProgID handlers, App Paths, UserChoice
-  entries, orphaned uninstall entries, orphaned shared DLL references
+  entries, orphaned shared DLL references, and orphaned uninstall entries. That last group includes
+  the stub Add/Remove Programs entry the Python.org installer can leave behind: no files, no
+  uninstall command, nothing any uninstaller can act on, so deleting the key is the only way to clear
+  it from Programs and Features.
 - **System** — environment variables, PATH entries, desktop and Start Menu shortcuts, app execution
   aliases, `py.exe` and `pyw.exe`
 - **Configuration** — `.condarc`, `.pypirc`, `pip.ini`, `.python-version`, and others
@@ -136,6 +139,10 @@ Console output is tagged by subsystem, for example
   registry location is writable without elevation.
 - Verification rebuilds the process PATH from the registry, so a successful cleanup is not reported
   as a failure.
+- Verification also re-scans Add/Remove Programs, so an installation that survived is reported as a
+  remaining component (exit code 3) rather than being quietly declared clean.
+- A reboot is only recommended when something actually warrants one: a failed removal, a terminated
+  process, or file renames Windows has already queued.
 
 ## Troubleshooting
 
