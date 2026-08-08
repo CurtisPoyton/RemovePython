@@ -1,49 +1,62 @@
 @echo off
-title Python Removal Script v1.0
+setlocal
+title Python Removal v2.0
 chcp 65001 >nul 2>&1
 
-:: --- Check that PowerShell 7+ (pwsh.exe) is available ---
+:: Usage:
+::   Run-RemovePython.bat                       preview then prompt
+::   Run-RemovePython.bat -ScanOnly             report only, change nothing
+::   Run-RemovePython.bat -Force                unattended removal, no prompt
+::   Run-RemovePython.bat -SkipRestorePoint     removal without a restore point
+::   Run-RemovePython.bat -WhatIf               show every action without doing it
+::   Run-RemovePython.bat -RestoreEnvironment <backup.json>
+::
+:: Exit codes: 0 clean, 1 critical failure, 2 operations failed,
+::             3 components remain, 4 cancelled, 5 pre-flight failed
+
 where pwsh >nul 2>&1
 if %errorlevel% neq 0 (
     echo.
-    echo ERROR: PowerShell 7+ ^(pwsh.exe^) not found.
+    echo ERROR: PowerShell 7+ ^(pwsh.exe^) was not found.
     echo This script requires PowerShell 7.5 or later.
-    echo Download from: https://aka.ms/powershell-release?tag=stable
+    echo Download it from: https://aka.ms/powershell-release?tag=stable
     pause
     exit /b 1
 )
 
-:: --- Self-elevate to Administrator if needed ---
 net session >nul 2>&1
-if %errorlevel% equ 0 goto :main
+if %errorlevel% equ 0 goto :elevated
 
 echo Requesting administrator privileges...
-pwsh -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList '%*'" 2>nul
+if "%~1"=="" (
+    pwsh -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0'" 2>nul
+) else (
+    pwsh -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList '%*'" 2>nul
+)
 if %errorlevel% neq 0 (
     echo.
-    echo ERROR: Could not obtain administrator privileges.
-    echo Please right-click this file and select "Run as administrator".
+    echo ERROR: Administrator privileges could not be obtained.
+    echo Right-click this file and choose "Run as administrator".
     pause
+    exit /b 1
 )
-exit /b
+exit /b 0
 
-:main
-:: Elevated processes default to System32 - restore script directory
+:elevated
+:: Elevated processes start in System32, so restore the script directory.
 cd /d "%~dp0"
 
 set "scriptPath=%~dp0RemovePython.ps1"
-
 if not exist "%scriptPath%" (
-    echo ERROR: Script not found at %scriptPath%
+    echo ERROR: RemovePython.ps1 was not found at %scriptPath%
     pause
     exit /b 1
 )
 
-:: Usage:
-::   Run-RemovePython.bat
-::   Run-RemovePython.bat -ScanOnly
-::   Run-RemovePython.bat -CreateBackup:$false
-
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%scriptPath%" %*
+set "runExitCode=%errorlevel%"
 
+echo.
+echo Finished with exit code %runExitCode%.
 pause
+exit /b %runExitCode%

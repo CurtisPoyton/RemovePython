@@ -2,11 +2,13 @@
 
 ## Project Overview
 
-**RemovePython** is a PowerShell script for completely removing Python installations and artifacts from Windows systems. This is a **destructive utility** requiring administrator privileges.
+**RemovePython** is a PowerShell script that removes Python installations and artefacts from Windows.
+It is a **destructive utility** and requires administrator privileges.
 
-**Version:** 1.1 | **Platform:** Windows 10/11 | **PowerShell:** 7.5+ | **Status:** Production-ready
+**Version:** 2.0 | **Platform:** Windows 10/11 | **PowerShell:** 7.5+
 
-**Coverage:** 200+ cleanup locations (90+ registry, 108+ directories/files, 4 virtual environment types, 6 PowerShell profiles)
+**Coverage:** 200+ cleanup locations (90+ registry keys, 60+ directory globs, 4 virtual environment
+types, 6 PowerShell profiles, the Windows Python Launcher binaries)
 
 ---
 
@@ -14,262 +16,258 @@
 
 ```
 RemovePython/
-├── RemovePython.ps1              # Main PowerShell script (~2100 lines)
-├── Run-RemovePython.bat          # Batch launcher with auto-elevation
+├── RemovePython.ps1              # Main script (~2400 lines, 61 functions)
+├── RemovePython.Tests.ps1        # Pester suite (~1580 lines, 276 tests)
+├── Run-RemovePython.bat          # Launcher with auto-elevation and exit-code propagation
+├── PSScriptAnalyzerSettings.psd1 # Lint configuration; the quality gate for this repo
 ├── CLAUDE.md                     # This file
-├── FINAL_SUMMARY.md              # Complete enhancement summary
-├── REGISTRY_CLEANUP.md           # Registry cleanup documentation
-├── DIRECTORY_CLEANUP.md          # Directory cleanup documentation
-├── FIXES_APPLIED.md              # Bug fixes documentation
-├── IMPROVEMENTS.md               # Log analysis and improvements
-└── *.txt, *.csv, *.json         # Generated log/report files (not tracked)
+├── README.md                     # User documentation
+└── *.txt, *.csv, *.json          # Generated logs and reports (git-ignored)
 ```
-
-### Core Files
-
-- **`RemovePython.ps1`** - Main script (~2100 lines). PSScriptAnalyzer clean (0 violations, all rules). Never modify without testing.
-- **`Run-RemovePython.bat`** - Auto-elevation launcher. Validates pwsh.exe before elevation.
-- **Documentation** - FINAL_SUMMARY.md, REGISTRY_CLEANUP.md, DIRECTORY_CLEANUP.md, FIXES_APPLIED.md, IMPROVEMENTS.md
 
 ---
 
 ## Safety Guidelines
 
-### Never Do
-- Disable or bypass `Test-PathSafe` function
-- Remove paths from `$script:protectedPaths` array
-- Allow deletion of root drives or skip path validation
-- Disable system restore point, `-WhatIf` support, or admin requirement
-- Use hardcoded user paths (always use environment variables)
+### Never do
 
-### Always Do
-- Test with `-ScanOnly` before making changes
-- Maintain try-catch blocks and increment counters (ItemsRemoved/ItemsFailed)
-- Use environment variables for paths (`$env:USERPROFILE`, `$env:APPDATA`)
-- Show progress for operations >1000 items
-- Run validation checks before committing
+- Weaken `Test-PathSafe` or remove entries from `$script:protectedPath`.
+- Broaden the launcher carve-out in `Test-PathSafe`. It matches `$env:WINDIR\py.exe` and
+  `$env:WINDIR\pyw.exe` by **exact, case-insensitive full-path equality only** — never a prefix,
+  never a glob, never a directory. `Remove-ItemSafely` and `Remove-FileSafely` route every
+  filesystem deletion through `Test-PathSafe`, so widening it widens everything.
+- Skip path validation, disable the restore point, drop `-WhatIf` support, or remove the
+  administrator requirement.
+- Hardcode user paths. Everything is built from environment variables in
+  `Initialize-Configuration`, which hard-fails through `Test-RequiredEnvironment` if any required
+  variable is empty.
+- Write `PATH` with `[Environment]::SetEnvironmentVariable`. That API always writes `REG_SZ` and
+  silently converts the machine `PATH` from `REG_EXPAND_SZ`, permanently baking in expanded values.
+  Use `Get-EnvironmentEntry` / `Set-EnvironmentEntry`, which preserve the registry value kind.
+
+### Always do
+
+- Test with `-ScanOnly` before making changes, and `-WhatIf` before trusting a new code path.
+- Route deletions through `Remove-ItemSafely`, `Remove-FileSafely` or `Remove-RegistryKeySet`.
+- Record every discovered item with `Add-Finding` and set `.Status` on the returned object to
+  `Removed`, `Failed` or `Skipped`. All counters, the CSV report and the exit code derive from
+  findings, so an unrecorded operation is invisible to every one of them.
+- Report failures through `Write-RemovalFailure`, which names the concrete exception type.
 
 ---
 
 ## Code Standards
 
-### PowerShell Conventions
-- Indentation: 4 spaces | Line length: 120 chars max | Braces: opening on same line
-- Functions: Verb-Noun | Variables: PascalCase (global), camelCase (local)
-- Paths: Always use environment variables
-- Strings: Single quotes for constants, double quotes only when interpolation needed
-- PSScriptAnalyzer: Must pass all rules at all severity levels (0 violations)
+- Indentation 4 spaces; maximum line length 120; opening brace on the same line; `else`/`catch` on
+  their own line after the closing brace.
+- Functions use approved Verb-Noun pairs with singular nouns. `Write-Log` is not available — it
+  collides with a built-in cmdlet, hence `Write-LogEntry`.
+- Single quotes for constant strings; double quotes only where interpolation is required.
+- Every parameter is typed. Avoid untyped or `[object]` parameters.
+- The script file must remain pure ASCII.
 
-### Required Attributes
+### Required attributes
+
 ```powershell
 #Requires -Version 7.5
 #Requires -RunAsAdministrator
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Remove')]
 ```
 
-### Error Handling
-All destructive operations must:
-1. Wrap in try-catch
-2. Increment `ItemsRemoved` (success) or `ItemsFailed` (error)
-3. Log success and failure with descriptive messages
+Any function whose verb is `New`, `Set`, `Remove`, `Start`, `Stop`, `Restart`, `Reset` or `Update`
+must declare `SupportsShouldProcess` and consult `$PSCmdlet.ShouldProcess` before acting.
+
+### Error handling
+
+Destructive operations wrap the action in `try`/`catch`, set the finding status, and log through
+`Write-RemovalFailure`. A per-item catch-all is deliberate: one item's failure must never abandon
+the remaining cleanup locations. It is not a swallowed exception — the concrete exception type and
+message are always logged and the item is counted as failed.
 
 ---
 
-## Development Workflow
+## Tagged Logging
 
-### Making Changes
-1. Read entire function and understand dependencies
-2. Test with `-ScanOnly` and `-WhatIf`
-3. Verify logging, try-catch coverage, and counter tracking
-4. Update documentation for significant features
-5. Run validation before committing
+Every log statement goes through `Write-LogEntry -Tag <tag> -Message <text> [-Level <level>]` and is
+emitted as `[tag] message`. The tag is validated case-sensitively against `^[a-z][a-z0-9_]*$`.
 
-### Testing
-```powershell
-.\RemovePython.ps1 -ScanOnly
-.\RemovePython.ps1 -WhatIf
-Get-Content .\Python_Removal_Log_*.txt
-```
+**Levels:** `Section`, `Found`, `Info` (default), `Success`, `Warn`, `Error`. The level sets the
+console colour; it is not part of the message.
 
-### Pre-Commit Checklist
-- [ ] No syntax errors, all parameters work
-- [ ] `-ScanOnly` and `-WhatIf` tested
-- [ ] Try-catch blocks and counter tracking verified
-- [ ] No hardcoded paths (use `$env:USERPROFILE`)
-- [ ] `Run-RemovePython.bat` works
-- [ ] Documentation updated if needed
+**Tags in use:** `alias`, `appx`, `config_file`, `directory`, `env_var`, `launcher`, `main`, `path`,
+`preflight`, `process`, `profile`, `registry`, `report`, `restore_point`, `safety`, `shortcut`,
+`temp_cache`, `uninstall`, `venv`, `verify`.
+
+Reuse an existing tag rather than inventing a near-duplicate. Messages are lower case and lead with
+the verb or outcome (`found: <x>`, `removed: <x>`, `remove failed: <x> - <type>: <detail>`).
 
 ---
 
-## Architecture Overview
+## Development Requirements
 
-### Execution Flow (10 phases with progress bar)
-1. Parameter validation & user confirmation
-2. Disk space check & system restore point creation
-3. Check/terminate running Python processes (skip PID ≤ 10)
-4. Uninstall Microsoft Store & traditional Python installations
-5. Remove environment variables (with backup)
-6. Remove directories (108+ locations), virtual environments (4 types), aliases
-7. Clear registry keys (90+ locations, HKCU + HKLM)
-8. Clean PowerShell profiles (conda init block removal)
-9. Post-removal verification & CSV report generation
-10. Summary statistics & report
-
-### Key Functions
-
-| Function | Purpose | Safety |
-|----------|---------|--------|
-| `Test-PathSafe` | Validates paths before deletion | CRITICAL |
-| `Remove-ItemSafely` | Safe wrapper with progress indication | CRITICAL |
-| `New-RestorePoint` | Creates system restore point | Important |
-| `Test-RunningProcess` | Finds/terminates processes (skips PID ≤ 10) | Destructive |
-| `Uninstall-TraditionalPython` | Removes installed Python | Destructive |
-| `Remove-EnvironmentVariable` | Clears env vars with backup | Destructive |
-| `Remove-PythonDirectory` | Removes 108+ locations | Destructive |
-| `Remove-VirtualEnvironment` | Removes 4 venv types | Destructive |
-| `Remove-AppExecutionAlias` | Removes Python app aliases | Destructive |
-| `Clear-Registry` | Cleans 90+ registry locations | Destructive |
-| `Remove-ProfileBlock` | Removes conda init from PS profiles | Destructive |
-| `Test-PostRemoval` | Verifies cleanup | Safe |
-
-### Protected Paths
-Never deletes: `$env:WINDIR`, `$env:SystemRoot`, `$env:ProgramFiles\Windows`, `${env:ProgramFiles(x86)}\Windows`, `C:\Windows`, `C:\Program Files\WindowsApps`
+- Fix any error found along the way, including pre-existing ones. Hard fail on fixable errors.
+- Remove dead code outright. Wire up unwired code where it benefits the script; otherwise delete it.
+- No backward-compatibility shims, historical comments, changelog entries, or comments that restate
+  what the code already says. Comments explain *why*, and only where the reason is not obvious.
+- Use Australian English in user-facing text.
 
 ---
 
-## Cleanup Coverage
+## Architecture
 
-### Registry (90+ locations)
-- Core Python keys (HKCU/HKLM:\Software\Python, Python Software Foundation)
-- Conda distributions (Anaconda, Miniconda, Mambaforge, Miniforge)
-- File associations HKCU + HKLM (11 extensions: .py, .pyw, .pyc, .pyo, .pyd, .pyi, .pyz, .pyzw, .pth, .whl, .ipynb)
-- File type handlers HKCU + HKLM (py_auto_file, Python.File, etc.)
-- Application associations HKCU + HKLM (python.exe, pythonw.exe, py.exe, pyw.exe, idle.exe)
-- UserChoice file extension associations (11 extensions)
-- App paths (python.exe, pythonw.exe, py.exe, pyw.exe, idle.exe + Wow6432Node)
-- Orphaned uninstall entries & shared DLL references
+### Execution flow
 
-### Directories (108+ locations)
-- Core installations (4), Conda distributions (12), Version managers (3)
-- Python Launcher (`$env:LOCALAPPDATA\Programs\Python\Launcher`)
-- Package managers: pip, UV, Poetry, PDM, Rye, Hatch, pipx, virtualenv, Pipenv
-- Development tools: Jupyter, IPython, JupyterLab, MyPy, Pytest, Ruff, Pylint, Black, Tox, Nox
-- Config files (8): .condarc, .pypirc, pip.ini (user + system), .python-version, etc.
-- Shortcuts (Desktop + Start Menu), temp/cache files (age-checked)
+`Initialize-Configuration` populates all script-scoped state, then:
 
-### Virtual Environments (4 types)
-1. Standard venv (.venv, venv, env)
-2. Conda environments (excludes base)
-3. Poetry environments
-4. Pipenv environments
+1. Open the log file (falls back to `$env:TEMP` when the log directory is not writable).
+2. `-RestoreEnvironment` short-circuits to `Restore-EnvironmentVariable` and exits.
+3. `Test-RequiredEnvironment` — hard fails with exit 5 if a required variable is empty.
+4. `Test-DiskSpace`, then `Confirm-Removal` unless `-Force`, `-ScanOnly` or `-WhatIf`.
+5. Fourteen phases run in order behind a progress bar (see below).
+6. `Test-PostRemoval` (skipped for `-ScanOnly` and `-WhatIf`), `New-Report`, `Write-Summary`.
+7. `Get-RunExitCode` determines the exit status.
 
-See REGISTRY_CLEANUP.md and DIRECTORY_CLEANUP.md for complete details.
+### Phases
+
+`New-RestorePoint` → `Test-RunningProcess` → `Uninstall-StorePython` →
+`Uninstall-TraditionalPython` → `Remove-EnvironmentVariable` → `Remove-PythonDirectory` →
+`Remove-PythonConfigFile` → `Remove-PythonShortcut` → `Remove-PythonTempFile` →
+`Remove-VirtualEnvironment` → `Remove-AppExecutionAlias` → `Remove-PythonLauncher` →
+`Clear-Registry` → `Remove-ProfileBlock`
+
+### Key functions
+
+| Function | Purpose | Notes |
+|----------|---------|-------|
+| `Initialize-Configuration` | Builds all script state from parameters and environment | Called by the script and by the test suite, so tests cannot drift from the script |
+| `Test-PathSafe` | Gate for every filesystem deletion | CRITICAL. Blocks root drives and protected paths; allows the two launcher binaries by exact match |
+| `Remove-ItemSafely` | Directory and reparse-point removal | Accepts a pre-computed `-Statistic` to avoid re-walking |
+| `Remove-FileSafely` | Single-file removal | |
+| `Remove-RegistryKeySet` | Bulk registry key removal | Used by all four registry key groups |
+| `Write-RemovalFailure` | Uniform failure logging and status | Names the concrete exception type |
+| `Get-DirectoryStatistic` | Size and file count in one pass | Skips reparse points |
+| `Get-DirectoryStatisticSet` | Parallel batch sizing | Falls back to a direct call for a single path |
+| `Get-ScanRootDirectory` | Top-level scan roots | Excludes junctions so linked trees are not counted twice |
+| `Get-EnvironmentEntry` / `Set-EnvironmentEntry` / `Remove-EnvironmentEntry` | Registry-native environment access | Preserves `REG_EXPAND_SZ` and reads unexpanded |
+| `Send-SettingChange` | Broadcasts `WM_SETTINGCHANGE` | Registry writes are otherwise invisible to running processes |
+| `Backup-EnvironmentVariable` / `Restore-EnvironmentVariable` | Environment backup and replay | Backup records the value kind per entry |
+| `Test-UninstallerTrust` | Authenticode check before running a vendor uninstaller | Refuses unsigned executables recorded under HKCU, which is writable without elevation |
+| `Test-InstallationPresent` | Orphan detection | Reports *present* when it cannot prove otherwise, so a still-registered MSI product is never stranded |
+| `Sync-ProcessPath` | Rebuilds `$env:Path` from the registry before verification | Without it, verification reads the stale launch-time PATH and reports false failures |
+
+### Concurrency
+
+The host is assumed to be many-core with fast storage. `MaxParallelism` is
+`[Math]::Clamp([Environment]::ProcessorCount, 2, 32)`.
+
+Two IO-bound stages run in parallel runspaces:
+
+- `Remove-VirtualEnvironment` scans each top-level profile subtree concurrently.
+- `Get-DirectoryStatisticSet` sizes candidate directories concurrently before removal.
+
+Everything else is deliberately serial: uninstallers must not run concurrently, registry deletions
+are order-dependent, and findings are appended from a single thread. Do not parallelise them.
+
+`ForEach-Object -Parallel` blocks must reference outer variables with `$using:` and must avoid a
+trailing multi-line pipeline — `PSUseConsistentIndentation` mis-models that shape and cascades a
+false indentation error across the rest of the file.
 
 ---
 
 ## Parameters
 
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `-ScanOnly` | False | Preview mode, no changes made |
-| `-CreateBackup` | True | Create system restore point |
-| `-SkipProcessCheck` | False | Skip running process check |
-| `-SkipDiskCheck` | False | Skip disk space validation |
-| `-IncludeNetworkDrives` | False | Allow network operations (caution) |
-| `-MinFreeDiskSpaceGB` | 5 | Minimum free space (GB) |
-| `-TimeoutSeconds` | 300 | Uninstall operation timeout |
-| `-MaxScanDepth` | 8 | Virtual environment scan depth (3-15) |
+| Parameter | Set | Default | Purpose |
+|-----------|-----|---------|---------|
+| `-ScanOnly` | Remove | False | Preview mode; nothing is changed |
+| `-SkipRestorePoint` | Remove | False | Do not create a system restore point |
+| `-SkipProcessCheck` | Remove | False | Do not look for running Python processes |
+| `-SkipDiskCheck` | Remove | False | Do not validate free disk space |
+| `-IncludeNetworkDrives` | Remove | False | Allow removal of network paths |
+| `-Force` | Remove | False | Skip the confirmation prompt; required for unattended runs |
+| `-MinFreeDiskSpaceGB` | Remove | 5 | Free-space warning threshold |
+| `-TimeoutSeconds` | Remove | 300 | Uninstaller timeout |
+| `-MaxScanDepth` | Remove | 8 | Virtual environment scan depth (3-15) |
+| `-RestoreEnvironment` | Restore | — | Replay an environment backup, then exit |
+| `-LogDirectory` | Both | `$PSScriptRoot` | Destination for log, report and backup |
+
+## Exit codes
+
+`0` clean · `1` critical failure · `2` operations failed · `3` components remain ·
+`4` cancelled at the prompt · `5` pre-flight validation failed
 
 ---
 
-## Common Modifications
+## Adding cleanup locations
 
-### Adding Cleanup Locations
-- **Directories**: Add to `$globs` in `Remove-PythonDirectory` (use `$env:USERPROFILE`, never hardcode)
-- **Config files**: Add to `$configFiles` in `Remove-PythonDirectory`
-- **Registry keys**: Add to `$keys` in `Clear-Registry`
-- **Environment vars**: Add to `$script:pythonVariables`
-- **Processes**: Update `$script:pythonPatterns.ProcessNames` regex
+All detection data lives in `Initialize-Configuration`. Build paths with `Join-Path` and an
+environment variable; never concatenate a literal user path.
+
+| Target | Add to |
+|--------|--------|
+| Directories | `$script:directoryGlob` (or `$script:coreInstallGlob` for an install root, which also feeds verification) |
+| Configuration files | `$script:configFile` |
+| Registry keys | `$script:coreRegistryKey` |
+| File extensions | `$script:fileExtension` — automatically expands into association and UserChoice keys |
+| ProgID handlers | `$script:fileHandler` |
+| Environment variables | `$script:pythonVariable` |
+| Process names | `$script:pattern.ProcessName` — anchor every alternation; an unanchored `^mypy` also matches `mypythonapp` and this script terminates what it matches |
+| Installation names | `$script:pattern.InstallInclude` — use `Name\d*` so `Anaconda3` matches; a bare `\bAnaconda\b` does not |
 
 ---
 
-## Bug Fixes Applied
+## Testing
 
-1. **System restore point** - Fixed type mismatch with [uint32] casting
-2. **Process termination** - Skip system processes (PID ≤ 10)
-3. **MSI errors** - Enhanced error messages for codes 1601, 1602, 1603, 1605, 1618, 1619, 1633
-4. **EXE uninstaller** - Added verbose logging and manual command on failure
-5. **Directory deletion** - Progress display for >1000 items
-6. **Counter tracking** - Added ItemsRemoved/ItemsFailed to all operations
-7. **Unknown uninstallers** - Log warnings for manual intervention
-8. **Orphan detection** - Fixed path extraction for paths with spaces (was truncating at first space)
-9. **Temp file cleanup** - Now handles both files and directories (was silently skipping files)
-10. **Long-path fallback** - Fixed TrimStart character-set bug with regex replacement
-11. **Batch launcher** - Validates pwsh.exe availability; uses pwsh consistently for elevation
+```powershell
+Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1   # must return nothing
+Invoke-Formatter -ScriptDefinition (Get-Content ./RemovePython.ps1 -Raw) -Settings ./PSScriptAnalyzerSettings.psd1
+Invoke-Pester -Path ./RemovePython.Tests.ps1
+.\RemovePython.ps1 -ScanOnly
+```
 
-See FIXES_APPLIED.md for details.
+The settings file is the gate, not the default rule set. `Invoke-ScriptAnalyzer` without `-Settings`
+skips the opt-in formatting rules and reports a clean file that is not.
+
+The suite loads functions out of `RemovePython.ps1` by AST parsing and calls
+`Initialize-Configuration`, so it never executes the script and never duplicates its data. Tests
+confine writes to `TestDrive`, `HKCU:\Software\RemovePythonPesterScratch` and a single scratch
+environment value, all removed in `AfterAll`.
+
+Note that `TestDrive` resolves under `AppData\Local`, which the production scan-exclusion pattern
+rejects wholesale; tests exercising that pattern swap in a benign one and restore it.
+
+### Pre-commit checklist
+
+- [ ] Analyzer returns zero findings with the settings file
+- [ ] `Invoke-Formatter` is a no-op
+- [ ] Full Pester suite passes
+- [ ] `-ScanOnly` and `-WhatIf` verified against a real machine, with state unchanged afterwards
+- [ ] New operations record a finding and set its status
+- [ ] Documentation updated
 
 ---
 
 ## Git Workflow
 
-### Commit Format
 ```
 <type>: <subject>
 
 <body>
 
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 ```
+
 **Types:** feat, fix, refactor, docs, test, chore
 
-### Tracked Files
-Track: *.ps1, *.bat, *.md (documentation)
-Ignore: *.txt (logs), *.csv (reports), *.json (backups)
+Track `*.ps1`, `*.bat`, `*.psd1`, `*.md`. Ignore generated `*.txt`, `*.csv`, `*.json`.
 
 ---
 
 ## Troubleshooting
 
-**Access Denied** - Run as Administrator, close Python processes, check file attributes
-**MSI hangs** - Increase `-TimeoutSeconds`, check for pending reboots, verify Windows Installer service
-**Registry denied** - Confirm admin rights, some keys may be TrustedInstaller-owned
-**Process won't stop** - Use Task Manager or check services (services.msc)
+**Access denied** — run as administrator, close Python processes, check file attributes.
+**MSI hangs** — raise `-TimeoutSeconds`, check for a pending reboot, verify the Windows Installer service.
+**Registry denied** — some keys are owned by TrustedInstaller and cannot be removed under normal elevation.
+**Verification fails on py.exe** — the launcher MSI did not uninstall; the log prints the exact manual command.
 
-**MSI Exit Codes:** 1601 (service not accessible), 1603 (fatal error), 1605 (not found)
-
-## Performance
-
-**Typical runtime:** 1-3 minutes (varies by installations, cache size, venv count, disk I/O)
-**Large caches:** UV (5+ GB), Conda (10+ GB), Poetry (1-3 GB), pip (500MB-2GB)
-**Progress indicators:** Show for operations >1000 items
-
----
-
-## Version History
-
-### v1.1 (2026-05-11)
-**New:** PowerShell profile cleanup (conda init removal), HKLM file associations, UserChoice registry keys, .ipynb/.jupyter/.ipython/.jupyterlab cleanup, Python Launcher directory, progress bar across all phases, venv scan optimization (skips heavy subtrees)
-
-**Fixed:** Orphan detection path truncation, temp file-only cleanup, long-path TrimStart bug, misleading "tools remain functional" message, batch launcher pwsh validation
-
-**Quality:** PSScriptAnalyzer clean — 0 violations across all rules (default + formatting + style)
-
-### v1.0 (2026-02-28)
-**Features:** 158+ cleanup locations, 4 venv types, system restore, user confirmation, progress tracking, comprehensive logging, CSV reports, post-removal verification
-
-**Safety:** Protected paths, root drive protection, system process protection (PID ≤ 10), age-based temp deletion, orphan detection, try-catch coverage, WhatIf/ScanOnly support
-
-**Documentation:** CLAUDE.md, FINAL_SUMMARY.md, REGISTRY_CLEANUP.md, DIRECTORY_CLEANUP.md, FIXES_APPLIED.md, IMPROVEMENTS.md
-
----
-
-## License & Disclaimer
-
-**USE AT YOUR OWN RISK** - This script permanently removes Python installations, environments, caches, and configurations. Always create a system restore point (enabled by default), backup data, and test with `-ScanOnly` first.
-
-**Preserved:** IDE installations (PyCharm, VS Code), user scripts outside standard Python locations, data files
-
----
-
-*Last Updated: 2026-05-11 | Status: Production-ready | Coverage: 200+ locations*
+**Preserved:** IDE installations (PyCharm, VS Code), user scripts outside standard Python locations,
+data files, and the Poetry / PDM / Rye / Hatch / pipx / Jupyter binaries.
