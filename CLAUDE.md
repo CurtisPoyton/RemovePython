@@ -31,7 +31,13 @@ RemovePython/
 
 ### Never do
 
-- Weaken `Test-PathSafe` or remove entries from `$script:protectedPath`.
+- Weaken `Test-PathSafe` or remove entries from `$script:protectedPath`. That set includes the
+  user's **Documents** folder in all three of its forms — the shell-reported location (which follows
+  OneDrive redirection), `%USERPROFILE%\Documents`, and the legacy `My Documents` junction. Documents
+  holds live project work, including virtual environments this script would otherwise match.
+- Add a filesystem write or delete that does not consult `Test-PathSafe` first. `Remove-ProfileBlock`
+  edits and deletes files directly rather than through the removal primitives, so it calls the gate
+  itself; any new phase in that shape must do the same.
 - Broaden the launcher carve-out in `Test-PathSafe`. It matches `$env:WINDIR\py.exe` and
   `$env:WINDIR\pyw.exe` by **exact, case-insensitive full-path equality only** — never a prefix,
   never a glob, never a directory. `Remove-ItemSafely` and `Remove-FileSafely` route every
@@ -135,12 +141,17 @@ the verb or outcome (`found: <x>`, `removed: <x>`, `remove failed: <x> - <type>:
 `Remove-VirtualEnvironment` → `Remove-AppExecutionAlias` → `Remove-PythonLauncher` →
 `Clear-Registry` → `Remove-ProfileBlock`
 
+Because Documents is protected, the four per-user PowerShell profile locations
+(`Documents\PowerShell` and `Documents\WindowsPowerShell`) are reported as `Skipped` rather than
+edited. Only the two machine-wide profiles under `%ProgramFiles%\PowerShell\7` are still in scope.
+Virtual environments found beneath Documents are likewise reported and skipped, never removed.
+
 ### Key functions
 
 | Function | Purpose | Notes |
 |----------|---------|-------|
 | `Initialize-Configuration` | Builds all script state from parameters and environment | Called by the script and by the test suite, so tests cannot drift from the script |
-| `Test-PathSafe` | Gate for every filesystem deletion | CRITICAL. Blocks root drives and protected paths; allows the two launcher binaries by exact match |
+| `Test-PathSafe` | Gate for every filesystem write and deletion | CRITICAL. Blocks root drives, Windows locations and the whole Documents tree; allows the two launcher binaries by exact match |
 | `Remove-ItemSafely` | Directory and reparse-point removal | Accepts a pre-computed `-Statistic` to avoid re-walking |
 | `Remove-FileSafely` | Single-file removal | |
 | `Remove-RegistryKeySet` | Bulk registry key removal | Used by all four registry key groups |

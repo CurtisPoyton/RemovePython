@@ -45,8 +45,10 @@ Run-RemovePython.bat             # launcher; elevates automatically
 - **System** — environment variables, PATH entries, desktop and Start Menu shortcuts, app execution
   aliases, `py.exe` and `pyw.exe`
 - **Configuration** — `.condarc`, `.pypirc`, `pip.ini`, `.python-version`, and others
-- **PowerShell profiles** — conda initialisation blocks, removed after backing the profile up. Other
-  Python-related lines are reported for manual review rather than edited.
+- **PowerShell profiles** — conda initialisation blocks in the machine-wide profiles under
+  `%ProgramFiles%\PowerShell\7`, removed after backing the profile up. Per-user profiles live in
+  Documents and are therefore skipped. Other Python-related lines are reported for manual review
+  rather than edited.
 
 **Preserved:** IDEs such as PyCharm and VS Code, user scripts outside standard Python locations, and
 the Poetry, PDM, Rye, Hatch, pipx and Jupyter binaries. Those tools will need a Python reinstall
@@ -106,6 +108,10 @@ Console output is tagged by subsystem, for example
 
 ## Safety
 
+- **Your Documents folder is never touched.** It is protected in all three of its forms: the
+  shell-reported location (following OneDrive redirection), `%USERPROFILE%\Documents`, and the legacy
+  `My Documents` junction. Virtual environments and PowerShell profiles found there are reported as
+  `Skipped` in the log and CSV, never removed.
 - Protected paths, root drives and network paths are refused. The only exception is `py.exe` and
   `pyw.exe` in the Windows directory, matched by exact full path.
 - Pre-flight validation refuses to run if any required environment variable is empty, which would

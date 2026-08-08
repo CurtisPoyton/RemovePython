@@ -185,6 +185,45 @@ Describe 'Safety: Test-PathSafe' -Tag 'Safety', 'Critical' {
         }
     }
 
+    Context 'Documents is protected' {
+
+        It 'Rejects the Documents folder itself' {
+            Test-PathSafe -Path (Join-Path $env:USERPROFILE 'Documents') | Should -BeFalse
+        }
+
+        It 'Rejects the shell-reported Documents location' {
+            Test-PathSafe -Path ([Environment]::GetFolderPath('MyDocuments')) | Should -BeFalse
+        }
+
+        It 'Rejects a project virtual environment under Documents' {
+            $venv = Join-Path $env:USERPROFILE 'Documents\Scripts\media_analyser\.venv'
+            Test-PathSafe -Path $venv | Should -BeFalse
+        }
+
+        It 'Rejects a PowerShell profile under Documents' {
+            $profileFile = Join-Path $env:USERPROFILE 'Documents\PowerShell\Microsoft.PowerShell_profile.ps1'
+            Test-PathSafe -Path $profileFile | Should -BeFalse
+        }
+
+        It 'Rejects the legacy My Documents junction path' {
+            Test-PathSafe -Path (Join-Path $env:USERPROFILE 'My Documents\Scripts\app\.venv') | Should -BeFalse
+        }
+
+        It 'Rejects Documents regardless of case' {
+            Test-PathSafe -Path (Join-Path $env:USERPROFILE 'DOCUMENTS\Scripts') | Should -BeFalse
+        }
+
+        It 'Still allows sibling profile locations outside Documents' {
+            Test-PathSafe -Path (Join-Path $env:USERPROFILE 'Desktop\Python.lnk') | Should -BeTrue
+            Test-PathSafe -Path (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313') | Should -BeTrue
+        }
+
+        It 'Lists every Documents form in the protected path set' {
+            $script:protectedPath | Should -Contain (Join-Path $env:USERPROFILE 'Documents')
+            $script:protectedPath | Should -Contain (Join-Path $env:USERPROFILE 'My Documents')
+        }
+    }
+
     Context 'Python Launcher carve-out' {
 
         It 'Allows the exact launcher binary <Name>' -TestCases @(
@@ -1367,6 +1406,55 @@ poetry run python app.py
         It 'Ignores unrelated content' {
             Get-ProfilePythonLine -Content "Set-Alias ll Get-ChildItem`nImport-Module posh-git`n" |
                 Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Remove-ProfileBlock honours the protected path gate' {
+
+        BeforeEach {
+            Clear-FindingState
+            $script:config.ScanOnly = $false
+            $script:originalProfilePath = $script:profilePath
+            $script:originalProtectedPath = $script:protectedPath
+        }
+
+        AfterEach {
+            $script:profilePath = $script:originalProfilePath
+            $script:protectedPath = $script:originalProtectedPath
+        }
+
+        It 'Leaves a profile in a protected location untouched' {
+            $guarded = Join-Path $TestDrive 'guarded'
+            $null = New-Item -Path $guarded -ItemType Directory -Force
+            $target = Join-Path $guarded 'Microsoft.PowerShell_profile.ps1'
+            $content = "#region conda initialize`nconda activate base`n#endregion`nWrite-Output keep"
+            Set-Content -LiteralPath $target -Value $content
+
+            $script:profilePath = @($target)
+            $script:protectedPath = @($guarded)
+
+            Remove-ProfileBlock
+
+            (Get-Content -LiteralPath $target -Raw) | Should -Match 'conda initialize'
+            @(Get-ChildItem -LiteralPath $guarded -Filter '*.bak_*').Count | Should -Be 0
+            Get-FindingCount -Status 'Skipped' | Should -Be 1
+            Get-FindingCount -Status 'Removed' | Should -Be 0
+        }
+
+        It 'Still processes a profile outside any protected location' {
+            $open = Join-Path $TestDrive 'open'
+            $null = New-Item -Path $open -ItemType Directory -Force
+            $target = Join-Path $open 'Microsoft.PowerShell_profile.ps1'
+            $content = "#region conda initialize`nconda activate base`n#endregion`nWrite-Output keep"
+            Set-Content -LiteralPath $target -Value $content
+
+            $script:profilePath = @($target)
+            $script:protectedPath = @($env:WINDIR)
+
+            Remove-ProfileBlock
+
+            (Get-Content -LiteralPath $target -Raw) | Should -Not -Match 'conda initialize'
+            Get-FindingCount -Status 'Removed' | Should -Be 1
         }
     }
 

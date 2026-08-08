@@ -235,6 +235,19 @@ function Initialize-Configuration {
         $script:protectedPath += (Join-Path ${env:ProgramFiles(x86)} 'Windows')
     }
 
+    # Documents holds live project work, including virtual environments this script would otherwise
+    # match. Guard the shell-reported location, which follows OneDrive redirection, the literal
+    # profile path, and the legacy junction that reaches the same tree under a different prefix.
+    $documentsPath = @(
+        [Environment]::GetFolderPath('MyDocuments'),
+        (Join-Path $env:USERPROFILE 'Documents'),
+        (Join-Path $env:USERPROFILE 'My Documents')
+    )
+    foreach ($candidate in $documentsPath) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if ($script:protectedPath -notcontains $candidate) { $script:protectedPath += $candidate }
+    }
+
     $script:pythonVariable = @(
         'PYTHONPATH', 'PYTHONHOME', 'PYTHON', 'PYTHONDONTWRITEBYTECODE', 'PYTHONUNBUFFERED',
         'PYTHONSTARTUP', 'PYTHONCASEOK', 'PYTHONIOENCODING', 'PYTHONFAULTHANDLER',
@@ -658,7 +671,7 @@ function Test-PathSafe {
         $isChild = $normalised.StartsWith("$trimmed\", [StringComparison]::OrdinalIgnoreCase)
         $isSelf = $normalised.Equals($trimmed, [StringComparison]::OrdinalIgnoreCase)
         if ($isSelf -or $isChild) {
-            Write-LogEntry -Tag 'safety' -Level Warn -Message "blocked protected system path: $normalised"
+            Write-LogEntry -Tag 'safety' -Level Warn -Message "blocked protected path: $normalised"
             return $false
         }
     }
@@ -2048,6 +2061,14 @@ function Remove-ProfileBlock {
 
     foreach ($path in $script:profilePath) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+
+        # This phase edits and deletes files directly, so it must consult the same gate the
+        # filesystem primitives use; otherwise a protected location would still be modified.
+        if (-not (Test-PathSafe -Path $path)) {
+            $profileName = Split-Path -Path $path -Leaf
+            (Add-Finding -Type 'Profile' -Name $profileName -Path $path).Status = 'Skipped'
+            continue
+        }
 
         try {
             $content = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
