@@ -149,9 +149,11 @@ function Initialize-Configuration {
         Version                 = '2.0'
         LogDirectory            = $LogDirectory
         LogFile                 = Join-Path $LogDirectory "Python_Removal_Log_$stamp.txt"
+        MarkdownFile            = Join-Path $LogDirectory "Python_Removal_Log_$stamp.md"
         ReportFile              = Join-Path $LogDirectory "Python_Removal_Report_$stamp.csv"
         BackupFile              = Join-Path $LogDirectory "Python_EnvVars_Backup_$stamp.json"
         ScanOnly                = [bool]$ScanOnly
+        RestoreMode             = $false
         SkipRestorePoint        = [bool]$SkipRestorePoint
         SkipProcessCheck        = [bool]$SkipProcessCheck
         SkipDiskCheck           = [bool]$SkipDiskCheck
@@ -176,7 +178,12 @@ function Initialize-Configuration {
     $script:state = @{
         Findings          = [System.Collections.Generic.List[object]]::new()
         VerificationIssue = [System.Collections.Generic.List[string]]::new()
+        PhaseTiming       = [System.Collections.Generic.List[object]]::new()
+        ManualAction      = [System.Collections.Generic.List[object]]::new()
+        BlockedPath       = [System.Collections.Generic.List[object]]::new()
+        Transcript        = [System.Text.StringBuilder]::new()
         StartTime         = [datetime]::Now
+        ErrorCountAtStart = $Error.Count
         LogWriter         = $null
         ExitCode          = 0
     }
@@ -521,6 +528,8 @@ function Write-LogEntry {
 
     $line = "[$Tag] $Message"
 
+    if ($script:state.Transcript) { [void]$script:state.Transcript.AppendLine($line) }
+
     if ($script:state.LogWriter) {
         $stamp = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff')
         try { $script:state.LogWriter.WriteLine("[$stamp][$($Level.ToUpperInvariant())]$line") }
@@ -547,7 +556,28 @@ function Write-Section {
     )
 
     Write-Information ''
+    if ($script:state.Transcript) { [void]$script:state.Transcript.AppendLine() }
     Write-LogEntry -Tag $Tag -Level Section -Message "=== $Title ==="
+}
+
+function Add-ManualAction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Item,
+
+        [Parameter(Mandatory)]
+        [string]$Reason,
+
+        [AllowEmptyString()]
+        [string]$Command = ''
+    )
+
+    [void]$script:state.ManualAction.Add([pscustomobject]@{
+            Item    = $Item
+            Reason  = $Reason
+            Command = $Command
+        })
 }
 #endregion
 
@@ -576,6 +606,7 @@ function Add-Finding {
         Size      = Format-FileSize -Bytes $SizeBytes
         SizeBytes = $SizeBytes
         Status    = 'Found'
+        Reason    = ''
         Timestamp = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
     }
     [void]$script:state.Findings.Add($finding)
@@ -624,6 +655,23 @@ function Format-FileSize {
     return "$value $($unit[$order])"
 }
 
+function Add-BlockedPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Reason
+    )
+
+    # An empty List is falsy in PowerShell, so this must be an explicit null test.
+    if ($null -eq $script:state.BlockedPath) { return }
+    if ($script:state.BlockedPath.Where({ $_.Path -eq $Path }, 'First').Count -gt 0) { return }
+
+    [void]$script:state.BlockedPath.Add([pscustomobject]@{ Path = $Path; Reason = $Reason })
+}
+
 function Test-PathSafe {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -636,6 +684,7 @@ function Test-PathSafe {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
 
     if ($Path -match '^[A-Za-z]:$') {
+        Add-BlockedPath -Path $Path -Reason 'root drive'
         Write-LogEntry -Tag 'safety' -Level Warn -Message "blocked root drive: $Path"
         return $false
     }
@@ -653,6 +702,7 @@ function Test-PathSafe {
     }
 
     if ($normalised -match '^[A-Za-z]:\\?$') {
+        Add-BlockedPath -Path $normalised -Reason 'root drive'
         Write-LogEntry -Tag 'safety' -Level Warn -Message "blocked root drive: $normalised"
         return $false
     }
@@ -671,6 +721,7 @@ function Test-PathSafe {
         $isChild = $normalised.StartsWith("$trimmed\", [StringComparison]::OrdinalIgnoreCase)
         $isSelf = $normalised.Equals($trimmed, [StringComparison]::OrdinalIgnoreCase)
         if ($isSelf -or $isChild) {
+            Add-BlockedPath -Path $normalised -Reason "protected location: $trimmed"
             Write-LogEntry -Tag 'safety' -Level Warn -Message "blocked protected path: $normalised"
             return $false
         }
@@ -864,6 +915,30 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, UIntPtr wP
 #endregion
 
 #region Removal Primitives
+function Add-SkippedFinding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Type,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Reason,
+
+        [int64]$SizeBytes = 0
+    )
+
+    $finding = Add-Finding -Type $Type -Name $Name -Path $Path -SizeBytes $SizeBytes
+    $finding.Status = 'Skipped'
+    $finding.Reason = $Reason
+}
+
 function Write-RemovalFailure {
     [CmdletBinding()]
     param(
@@ -882,7 +957,8 @@ function Write-RemovalFailure {
 
     $Finding.Status = 'Failed'
     $type = $ErrorRecord.Exception.GetType().Name
-    Write-LogEntry -Tag $Tag -Level Error -Message "remove failed: $Target - ${type}: $($ErrorRecord.Exception.Message)"
+    $Finding.Reason = "${type}: $($ErrorRecord.Exception.Message)"
+    Write-LogEntry -Tag $Tag -Level Error -Message "remove failed: $Target - $($Finding.Reason)"
 }
 
 function Remove-ItemSafely {
@@ -907,14 +983,18 @@ function Remove-ItemSafely {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Ignore
     if (-not $item) { return }
 
+    $knownSize = if ($Statistic) { [int64]$Statistic.SizeBytes } else { [int64]0 }
+
     if (-not (Test-PathSafe -Path $Path)) {
-        (Add-Finding -Type $Type -Name $Name -Path $Path).Status = 'Skipped'
+        Add-SkippedFinding -Type $Type -Name $Name -Path $Path -SizeBytes $knownSize `
+            -Reason 'blocked by the protected path policy'
         return
     }
 
     if (-not $script:config.IncludeNetworkDrives -and (Test-IsNetworkPath -Path $Path)) {
         Write-LogEntry -Tag $Tag -Level Warn -Message "skipped network path: $Path"
-        (Add-Finding -Type $Type -Name $Name -Path $Path).Status = 'Skipped'
+        Add-SkippedFinding -Type $Type -Name $Name -Path $Path -SizeBytes $knownSize `
+            -Reason 'network path excluded'
         return
     }
 
@@ -1002,7 +1082,7 @@ function Remove-FileSafely {
     if (-not $item) { return }
 
     if (-not (Test-PathSafe -Path $Path)) {
-        (Add-Finding -Type $Type -Name $Name -Path $Path).Status = 'Skipped'
+        Add-SkippedFinding -Type $Type -Name $Name -Path $Path -Reason 'blocked by the protected path policy'
         return
     }
 
@@ -1405,6 +1485,9 @@ function Test-UninstallerTrust {
 
     Write-LogEntry -Tag 'uninstall' -Level Error `
         -Message 'refusing to run an unsigned uninstaller recorded under HKCU; that key is writable without elevation'
+    Add-ManualAction -Item $Path `
+        -Reason 'unsigned uninstaller recorded under HKCU; review it before running elevated' `
+        -Command "& `"$Path`""
     return $false
 }
 
@@ -1469,6 +1552,8 @@ function Invoke-ExeUninstall {
 
     Write-LogEntry -Tag 'uninstall' -Level Error -Message "automatic uninstall failed: $DisplayName"
     Write-LogEntry -Tag 'uninstall' -Level Warn -Message "run manually: `"$Path`" $base"
+    Add-ManualAction -Item $DisplayName -Reason 'every silent uninstall attempt failed' `
+        -Command "& `"$Path`" $base"
     return $false
 }
 
@@ -1498,6 +1583,8 @@ function Uninstall-TraditionalPython {
 
         if ([string]::IsNullOrWhiteSpace($installation.UninstallString)) {
             $finding.Status = 'Skipped'
+            $finding.Reason = 'no uninstall command recorded'
+            Add-ManualAction -Item $installation.DisplayName -Reason 'no uninstall command recorded'
             Write-LogEntry -Tag 'uninstall' -Level Warn `
                 -Message "no uninstall command recorded for $($installation.DisplayName)"
             continue
@@ -1514,12 +1601,16 @@ function Uninstall-TraditionalPython {
         $executable = Get-UninstallExecutable -UninstallString $command
         if (-not $executable) {
             $finding.Status = 'Skipped'
+            $finding.Reason = 'unrecognised uninstall command'
+            Add-ManualAction -Item $installation.DisplayName `
+                -Reason 'unrecognised uninstall command' -Command $command
             Write-LogEntry -Tag 'uninstall' -Level Warn -Message "unrecognised uninstall command: $command"
             continue
         }
 
         if (-not (Test-Path -LiteralPath $executable.Path -PathType Leaf)) {
             $finding.Status = 'Skipped'
+            $finding.Reason = "uninstaller executable missing: $($executable.Path)"
             Write-LogEntry -Tag 'uninstall' -Level Warn -Message "uninstaller missing: $($executable.Path)"
             continue
         }
@@ -2065,8 +2156,8 @@ function Remove-ProfileBlock {
         # This phase edits and deletes files directly, so it must consult the same gate the
         # filesystem primitives use; otherwise a protected location would still be modified.
         if (-not (Test-PathSafe -Path $path)) {
-            $profileName = Split-Path -Path $path -Leaf
-            (Add-Finding -Type 'Profile' -Name $profileName -Path $path).Status = 'Skipped'
+            Add-SkippedFinding -Type 'Profile' -Name (Split-Path -Path $path -Leaf) -Path $path `
+                -Reason 'blocked by the protected path policy'
             continue
         }
 
@@ -2086,6 +2177,7 @@ function Remove-ProfileBlock {
 
         foreach ($line in (Get-ProfilePythonLine -Content $content)) {
             Write-LogEntry -Tag 'profile' -Level Warn -Message "manual review needed in ${path}: $line"
+            Add-ManualAction -Item $path -Reason "Python-related profile line needs review - $line"
         }
     }
 
@@ -2200,6 +2292,8 @@ function Test-PostRemoval {
             Write-LogEntry -Tag 'verify' -Level Error -Message "launcher binary remains: $binary"
             Write-LogEntry -Tag 'verify' -Level Warn `
                 -Message "remove manually with: Remove-Item -LiteralPath '$binary' -Force"
+            Add-ManualAction -Item $binary -Reason 'the launcher uninstaller did not remove this binary' `
+                -Command "Remove-Item -LiteralPath '$binary' -Force"
         }
     }
 
@@ -2280,6 +2374,323 @@ function New-Report {
     }
 }
 
+function ConvertTo-MarkdownCell {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Value,
+
+        [int]$MaximumLength = 300
+    )
+
+    if ([string]::IsNullOrEmpty($Value)) { return '-' }
+
+    $flat = ($Value -replace '\r?\n', ' ' -replace '\|', '\|').Trim()
+    if ($flat.Length -eq 0) { return '-' }
+    if ($flat.Length -gt $MaximumLength) { $flat = $flat.Substring(0, $MaximumLength - 3) + '...' }
+    return $flat
+}
+
+function Get-ExitCodeDescription {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([int]$ExitCode)
+
+    switch ($ExitCode) {
+        0 { 'completed with no failures' }
+        1 { 'critical failure; the run was abandoned' }
+        2 { 'completed, but one or more operations failed' }
+        3 { 'completed, but verification found remaining components' }
+        4 { 'cancelled at the confirmation prompt' }
+        5 { 'pre-flight validation failed; nothing was changed' }
+        default { 'unrecognised exit code' }
+    }
+}
+
+function Get-RunMode {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    if ($script:config.RestoreMode) { return 'Restore' }
+    if ($script:config.ScanOnly) { return 'Scan only (no changes)' }
+    if ($WhatIfPreference) { return 'WhatIf preview (no changes)' }
+    return 'Removal'
+}
+
+function Add-MarkdownFindingTable {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Text.StringBuilder]$Builder,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Finding,
+
+        [switch]$IncludeReason
+    )
+
+    $header = if ($IncludeReason) { '| Type | Name | Size | Reason |' } else { '| Type | Name | Size | Path |' }
+    $divider = '| --- | --- | --- | --- |'
+    [void]$Builder.AppendLine($header)
+    [void]$Builder.AppendLine($divider)
+
+    foreach ($item in ($Finding | Sort-Object Type, Name)) {
+        $last = if ($IncludeReason) { $item.Reason } else { $item.Path }
+        [void]$Builder.AppendLine(
+            "| $(ConvertTo-MarkdownCell $item.Type) | $(ConvertTo-MarkdownCell $item.Name) | " +
+            "$($item.Size) | $(ConvertTo-MarkdownCell $last) |")
+    }
+    [void]$Builder.AppendLine('')
+}
+
+function Write-MarkdownReport {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param()
+
+    $builder = [System.Text.StringBuilder]::new()
+    $findings = @($script:state.Findings)
+    $elapsed = [Math]::Round(([datetime]::Now - $script:state.StartTime).TotalSeconds, 1)
+    $removed = @($findings | Where-Object { $_.Status -eq 'Removed' })
+    $failed = @($findings | Where-Object { $_.Status -eq 'Failed' })
+    $skipped = @($findings | Where-Object { $_.Status -eq 'Skipped' })
+
+    [void]$builder.AppendLine('# Python Removal Run Log')
+    [void]$builder.AppendLine('')
+    [void]$builder.AppendLine('## Summary')
+    [void]$builder.AppendLine('')
+    [void]$builder.AppendLine('| Key | Value |')
+    [void]$builder.AppendLine('| --- | --- |')
+    [void]$builder.AppendLine("| Script Version | $($script:config.Version) |")
+    [void]$builder.AppendLine("| Generated | $([datetime]::Now.ToString('dd/MM/yyyy HH:mm:ss')) |")
+    [void]$builder.AppendLine("| Mode | $(Get-RunMode) |")
+    $exitCode = $script:state.ExitCode
+    [void]$builder.AppendLine("| Exit Code | $exitCode - $(Get-ExitCodeDescription $exitCode) |")
+    [void]$builder.AppendLine("| Runtime | ${elapsed}s |")
+    [void]$builder.AppendLine("| Items Found | $($findings.Count) |")
+    [void]$builder.AppendLine("| Items Removed | $($removed.Count) |")
+
+    $failedCell = if ($failed.Count -gt 0) { "**$($failed.Count)** - see ``## Failures``" } else { '0' }
+    [void]$builder.AppendLine("| Items Failed | $failedCell |")
+
+    $skippedCell = if ($skipped.Count -gt 0) { "**$($skipped.Count)** - see ``## Skipped``" } else { '0' }
+    [void]$builder.AppendLine("| Items Skipped | $skippedCell |")
+
+    $skippedSize = Get-FindingSize -Status 'Skipped'
+    if ($script:config.ScanOnly) {
+        $reclaimable = (Get-FindingSize) - $skippedSize
+        [void]$builder.AppendLine("| Reclaimable Size | $(Format-FileSize -Bytes $reclaimable) |")
+    }
+    else {
+        [void]$builder.AppendLine("| Space Freed | $(Format-FileSize -Bytes (Get-FindingSize -Status 'Removed')) |")
+    }
+    if ($skippedSize -gt 0) {
+        [void]$builder.AppendLine("| Left In Place By Skips | $(Format-FileSize -Bytes $skippedSize) |")
+    }
+
+    if ($script:state.VerificationIssue.Count -gt 0) {
+        [void]$builder.AppendLine(
+            "| **Verification** | **$($script:state.VerificationIssue.Count) component(s) remain** |")
+    }
+    if ($script:state.ManualAction.Count -gt 0) {
+        $actionCount = $script:state.ManualAction.Count
+        [void]$builder.AppendLine(
+            "| **Manual Action** | **$actionCount item(s)** - see ``## Manual Action Required`` |")
+    }
+    [void]$builder.AppendLine("| Text Log | ``$($script:config.LogFile)`` |")
+    [void]$builder.AppendLine("| CSV Report | ``$($script:config.ReportFile)`` |")
+    if (Test-Path -LiteralPath $script:config.BackupFile) {
+        [void]$builder.AppendLine("| Environment Backup | ``$($script:config.BackupFile)`` |")
+        [void]$builder.AppendLine('| Undo Command | `.\RemovePython.ps1 -RestoreEnvironment <backup>` |')
+    }
+    [void]$builder.AppendLine('')
+
+    [void]$builder.AppendLine('## Configuration')
+    [void]$builder.AppendLine('')
+    [void]$builder.AppendLine('| Setting | Value |')
+    [void]$builder.AppendLine('| --- | --- |')
+    foreach ($name in @(
+            'ScanOnly', 'Force', 'SkipRestorePoint', 'SkipProcessCheck', 'SkipDiskCheck',
+            'IncludeNetworkDrives', 'MinFreeDiskSpaceGB', 'TimeoutSeconds',
+            'ExeUninstallTimeoutSec', 'MaxScanDepth', 'MaxParallelism')) {
+        [void]$builder.AppendLine("| $name | $($script:config.$name) |")
+    }
+    [void]$builder.AppendLine("| LogDirectory | ``$($script:config.LogDirectory)`` |")
+    [void]$builder.AppendLine('')
+
+    [void]$builder.AppendLine('## Environment')
+    [void]$builder.AppendLine('')
+    [void]$builder.AppendLine('| Key | Value |')
+    [void]$builder.AppendLine('| --- | --- |')
+    [void]$builder.AppendLine("| Computer | $env:COMPUTERNAME |")
+    [void]$builder.AppendLine("| PowerShell | $($PSVersionTable.PSVersion) |")
+    [void]$builder.AppendLine("| OS | $([Environment]::OSVersion.VersionString) |")
+    [void]$builder.AppendLine("| Processors | $([Environment]::ProcessorCount) |")
+    [void]$builder.AppendLine("| System Drive | $env:SystemDrive |")
+    [void]$builder.AppendLine('')
+
+    if ($script:state.PhaseTiming.Count -gt 0) {
+        [void]$builder.AppendLine('## Phase Timings')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('| Phase | Duration | Items Found |')
+        [void]$builder.AppendLine('| --- | --- | --- |')
+        foreach ($phase in $script:state.PhaseTiming) {
+            [void]$builder.AppendLine("| $($phase.Name) | $($phase.Seconds)s | $($phase.Findings) |")
+        }
+        [void]$builder.AppendLine('')
+    }
+
+    if ($findings.Count -gt 0) {
+        [void]$builder.AppendLine('## Findings by Type')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('| Type | Found | Removed | Failed | Skipped | Size |')
+        [void]$builder.AppendLine('| --- | --- | --- | --- | --- | --- |')
+        foreach ($group in ($findings | Group-Object Type | Sort-Object Name)) {
+            $bytes = [int64](($group.Group | Measure-Object -Property SizeBytes -Sum).Sum ?? 0)
+            $groupRemoved = @($group.Group | Where-Object { $_.Status -eq 'Removed' }).Count
+            $groupFailed = @($group.Group | Where-Object { $_.Status -eq 'Failed' }).Count
+            $groupSkipped = @($group.Group | Where-Object { $_.Status -eq 'Skipped' }).Count
+            [void]$builder.AppendLine(
+                "| $($group.Name) | $($group.Count) | $groupRemoved | $groupFailed | $groupSkipped | " +
+                "$(Format-FileSize -Bytes $bytes) |")
+        }
+        [void]$builder.AppendLine('')
+    }
+
+    if ($failed.Count -gt 0) {
+        [void]$builder.AppendLine('## Failures')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('> Found, attempted, and the operation did not succeed.')
+        [void]$builder.AppendLine('')
+        foreach ($item in ($failed | Sort-Object Type, Name)) {
+            [void]$builder.AppendLine("### $(ConvertTo-MarkdownCell $item.Name)")
+            [void]$builder.AppendLine('')
+            [void]$builder.AppendLine("- **Type:** $($item.Type)")
+            [void]$builder.AppendLine("- **Path:** ``$($item.Path)``")
+            [void]$builder.AppendLine("- **Reason:** $(ConvertTo-MarkdownCell $item.Reason -MaximumLength 2000)")
+            [void]$builder.AppendLine('')
+        }
+    }
+
+    if ($skipped.Count -gt 0) {
+        [void]$builder.AppendLine('## Skipped')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('> These items were found but deliberately left alone. Nothing was attempted.')
+        [void]$builder.AppendLine('')
+        Add-MarkdownFindingTable -Builder $builder -Finding $skipped -IncludeReason
+    }
+
+    if ($script:state.BlockedPath.Count -gt 0) {
+        [void]$builder.AppendLine('## Paths Refused by the Safety Gate')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('| Path | Reason |')
+        [void]$builder.AppendLine('| --- | --- |')
+        foreach ($blocked in ($script:state.BlockedPath | Sort-Object Path)) {
+            [void]$builder.AppendLine(
+                "| ``$(ConvertTo-MarkdownCell $blocked.Path)`` | $(ConvertTo-MarkdownCell $blocked.Reason) |")
+        }
+        [void]$builder.AppendLine('')
+    }
+
+    if ($removed.Count -gt 0) {
+        [void]$builder.AppendLine('## Removed')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('<details>')
+        [void]$builder.AppendLine("<summary>$($removed.Count) item(s) removed</summary>")
+        [void]$builder.AppendLine('')
+        Add-MarkdownFindingTable -Builder $builder -Finding $removed
+        [void]$builder.AppendLine('</details>')
+        [void]$builder.AppendLine('')
+    }
+
+    if ($script:state.VerificationIssue.Count -gt 0) {
+        [void]$builder.AppendLine('## Verification')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('> Components still present after removal.')
+        [void]$builder.AppendLine('')
+        foreach ($issue in $script:state.VerificationIssue) {
+            [void]$builder.AppendLine("- $(ConvertTo-MarkdownCell $issue)")
+        }
+        [void]$builder.AppendLine('')
+    }
+
+    if ($script:state.ManualAction.Count -gt 0) {
+        [void]$builder.AppendLine('## Manual Action Required')
+        [void]$builder.AppendLine('')
+        foreach ($action in $script:state.ManualAction) {
+            [void]$builder.AppendLine("- **$(ConvertTo-MarkdownCell $action.Item)**")
+            [void]$builder.AppendLine("  - Reason: $(ConvertTo-MarkdownCell $action.Reason)")
+            if ($action.Command) {
+                [void]$builder.AppendLine("  - Command: ``$(ConvertTo-MarkdownCell $action.Command)``")
+            }
+        }
+        [void]$builder.AppendLine('')
+    }
+
+    Add-MarkdownErrorSection -Builder $builder
+
+    if ($script:state.Transcript.Length -gt 0) {
+        [void]$builder.AppendLine('## Console Output')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('<details>')
+        [void]$builder.AppendLine('<summary>Full tagged transcript</summary>')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('```')
+        [void]$builder.Append($script:state.Transcript.ToString())
+        [void]$builder.AppendLine('```')
+        [void]$builder.AppendLine('')
+        [void]$builder.AppendLine('</details>')
+    }
+
+    try {
+        # Written with the .NET API rather than Set-Content: Set-Content honours ShouldProcess, so
+        # -WhatIf would silently skip the report in the mode it is most useful for.
+        [System.IO.File]::WriteAllText(
+            $script:config.MarkdownFile, $builder.ToString(), [System.Text.UTF8Encoding]::new($false))
+        Write-Information "[report] review written: $($script:config.MarkdownFile)"
+    }
+    catch {
+        Write-Warning "[report] review write failed: $($_.Exception.GetType().Name): $($_.Exception.Message)"
+    }
+}
+
+function Add-MarkdownErrorSection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Text.StringBuilder]$Builder
+    )
+
+    $newErrorCount = $Error.Count - $script:state.ErrorCountAtStart
+    if ($newErrorCount -le 0) { return }
+
+    [void]$Builder.AppendLine('## PowerShell Errors')
+    [void]$Builder.AppendLine('')
+    [void]$Builder.AppendLine("$newErrorCount error record(s) were raised during this run.")
+    [void]$Builder.AppendLine('')
+    [void]$Builder.AppendLine('```')
+
+    $records = @($Error[0..($newErrorCount - 1)])
+    [array]::Reverse($records)
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($record in $records) {
+        $line = $record.InvocationInfo.ScriptLineNumber
+        $key = "${line}:$($record.Exception.Message)"
+        if (-not $seen.Add($key)) { continue }
+
+        [void]$Builder.AppendLine("$($record.Exception.GetType().Name) at line $line")
+        [void]$Builder.AppendLine($record.Exception.Message)
+        [void]$Builder.AppendLine('')
+    }
+    [void]$Builder.AppendLine('```')
+    [void]$Builder.AppendLine('')
+}
+
 function Write-Summary {
     [CmdletBinding()]
     param()
@@ -2302,16 +2713,22 @@ function Write-Summary {
         Write-LogEntry -Tag 'main' -Message "success rate: $rate%"
     }
 
+    $skippedSize = Get-FindingSize -Status 'Skipped'
     if ($script:config.ScanOnly) {
-        Write-LogEntry -Tag 'main' -Message "total size found: $(Format-FileSize -Bytes (Get-FindingSize))"
+        $reclaimable = (Get-FindingSize) - $skippedSize
+        Write-LogEntry -Tag 'main' -Message "reclaimable size: $(Format-FileSize -Bytes $reclaimable)"
     }
     else {
         Write-LogEntry -Tag 'main' -Message "space freed: $(Format-FileSize -Bytes (Get-FindingSize -Status 'Removed'))"
+    }
+    if ($skippedSize -gt 0) {
+        Write-LogEntry -Tag 'main' -Message "size left in place by skips: $(Format-FileSize -Bytes $skippedSize)"
     }
 
     $elapsed = [Math]::Round(([datetime]::Now - $script:state.StartTime).TotalSeconds, 1)
     Write-LogEntry -Tag 'main' -Message "elapsed: ${elapsed}s"
     Write-LogEntry -Tag 'main' -Message "log file: $($script:config.LogFile)"
+    Write-LogEntry -Tag 'main' -Message "review file: $($script:config.MarkdownFile)"
 }
 
 function Get-RunExitCode {
@@ -2379,6 +2796,7 @@ try {
     Write-LogEntry -Tag 'main' -Level Section -Message "=== PYTHON REMOVAL v$($script:config.Version) ==="
 
     if ($PSCmdlet.ParameterSetName -eq 'Restore') {
+        $script:config.RestoreMode = $true
         $script:state.ExitCode = if (Restore-EnvironmentVariable -BackupPath $RestoreEnvironment) { 0 } else { 1 }
         exit $script:state.ExitCode
     }
@@ -2416,7 +2834,17 @@ try {
     foreach ($phase in $phases.GetEnumerator()) {
         $percent = [Math]::Round(($index / $phases.Count) * 100)
         Write-Progress -Activity 'Python removal' -Status $phase.Key -PercentComplete $percent
+
+        $findingsBefore = $script:state.Findings.Count
+        $phaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
         & $phase.Value
+        $phaseTimer.Stop()
+
+        [void]$script:state.PhaseTiming.Add([pscustomobject]@{
+                Name     = $phase.Key
+                Seconds  = [Math]::Round($phaseTimer.Elapsed.TotalSeconds, 2)
+                Findings = $script:state.Findings.Count - $findingsBefore
+            })
         $index++
     }
     Write-Progress -Activity 'Python removal' -Completed
@@ -2445,6 +2873,9 @@ catch {
     exit 1
 }
 finally {
+    # Written unconditionally, including on a critical failure and under -WhatIf, because that is
+    # exactly when a review artefact is worth having.
+    if ($script:config -and $script:state) { Write-MarkdownReport }
     Close-LogFile
 }
 #endregion

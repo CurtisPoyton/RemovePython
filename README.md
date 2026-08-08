@@ -87,9 +87,24 @@ before they work again.
 
 | File | Contents |
 |------|----------|
+| `Python_Removal_Log_*.md` | Review report — read this one first |
 | `Python_Removal_Log_*.txt` | Timestamped, tagged log of every action |
-| `Python_Removal_Report_*.csv` | Every item found, with type, path, size and final status |
+| `Python_Removal_Report_*.csv` | Every item found, with type, path, size, status and reason |
 | `Python_EnvVars_Backup_*.json` | Environment variables and PATH, with registry value kinds |
+
+The Markdown report is written on every run — including `-WhatIf`, `-ScanOnly` and after a crash,
+since that is when it is most useful. It contains:
+
+- **Summary** — mode, exit code and its meaning, counts, reclaimable size versus size left in place
+- **Configuration** and **Environment** — every parameter and host detail, so a run is reproducible
+- **Phase timings** — duration and item count for each of the fourteen phases
+- **Findings by type** — found / removed / failed / skipped / size, broken down
+- **Failures** — each one with its path and the concrete exception type and message
+- **Skipped** and **Paths refused by the safety gate** — what was left alone and exactly why
+- **Verification**, **Manual action required** — anything still needing your attention, with commands
+- **Console output** — the full tagged transcript in a collapsed block
+
+Old reports are never pruned automatically; the script does not delete its own output.
 
 Console output is tagged by subsystem, for example
 `[registry] removed: HKLM:\Software\Python`. Colour is suppressed when output is redirected or when

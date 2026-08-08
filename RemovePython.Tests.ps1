@@ -1268,6 +1268,291 @@ Describe 'Findings and reporting' -Tag 'Reporting' {
     }
 }
 
+Describe 'Markdown review report' -Tag 'Reporting' {
+
+    Context 'ConvertTo-MarkdownCell' {
+
+        It 'Returns a dash for <Case>' -TestCases @(
+            @{ Case = 'null'; Value = $null }
+            @{ Case = 'empty string'; Value = '' }
+            @{ Case = 'whitespace'; Value = '   ' }
+        ) {
+            param($Value)
+            ConvertTo-MarkdownCell -Value $Value | Should -Be '-'
+        }
+
+        It 'Escapes pipe characters so the table is not broken' {
+            ConvertTo-MarkdownCell -Value 'a | b' | Should -Be 'a \| b'
+        }
+
+        It 'Flattens newlines onto a single line' {
+            ConvertTo-MarkdownCell -Value "line one`nline two" | Should -Be 'line one line two'
+        }
+
+        It 'Flattens Windows line endings' {
+            ConvertTo-MarkdownCell -Value "one`r`ntwo" | Should -Be 'one two'
+        }
+
+        It 'Truncates beyond the maximum length' {
+            $result = ConvertTo-MarkdownCell -Value ('x' * 500) -MaximumLength 50
+            $result.Length | Should -Be 50
+            $result | Should -BeLike '*...'
+        }
+
+        It 'Leaves ordinary text untouched' {
+            ConvertTo-MarkdownCell -Value 'C:\Python314' | Should -Be 'C:\Python314'
+        }
+    }
+
+    Context 'Get-ExitCodeDescription' {
+
+        It 'Describes exit code <Code>' -TestCases @(
+            @{ Code = 0 }, @{ Code = 1 }, @{ Code = 2 }
+            @{ Code = 3 }, @{ Code = 4 }, @{ Code = 5 }
+        ) {
+            param($Code)
+            Get-ExitCodeDescription -ExitCode $Code | Should -Not -BeNullOrEmpty
+            Get-ExitCodeDescription -ExitCode $Code | Should -Not -Be 'unrecognised exit code'
+        }
+
+        It 'Falls back for an unknown code' {
+            Get-ExitCodeDescription -ExitCode 99 | Should -Be 'unrecognised exit code'
+        }
+    }
+
+    Context 'Get-RunMode' {
+
+        AfterEach {
+            $script:config.ScanOnly = $false
+            $script:config.RestoreMode = $false
+        }
+
+        It 'Reports scan mode' {
+            $script:config.ScanOnly = $true
+            Get-RunMode | Should -BeLike 'Scan only*'
+        }
+
+        It 'Reports restore mode ahead of scan mode' {
+            $script:config.RestoreMode = $true
+            $script:config.ScanOnly = $true
+            Get-RunMode | Should -Be 'Restore'
+        }
+
+        It 'Reports removal mode by default' {
+            Get-RunMode | Should -Be 'Removal'
+        }
+    }
+
+    Context 'Add-BlockedPath' {
+
+        BeforeEach { $script:state.BlockedPath.Clear() }
+        AfterEach { $script:state.BlockedPath.Clear() }
+
+        It 'Records a blocked path when the list is empty' {
+            Add-BlockedPath -Path 'C:\Windows' -Reason 'protected location'
+            $script:state.BlockedPath.Count | Should -Be 1 -Because 'an empty List is falsy in PowerShell'
+        }
+
+        It 'Records the reason alongside the path' {
+            Add-BlockedPath -Path 'C:\Windows' -Reason 'protected location'
+            $script:state.BlockedPath[0].Path | Should -Be 'C:\Windows'
+            $script:state.BlockedPath[0].Reason | Should -Be 'protected location'
+        }
+
+        It 'Does not record the same path twice' {
+            Add-BlockedPath -Path 'C:\Windows' -Reason 'protected location'
+            Add-BlockedPath -Path 'C:\Windows' -Reason 'protected location'
+            $script:state.BlockedPath.Count | Should -Be 1
+        }
+
+        It 'Records distinct paths separately' {
+            Add-BlockedPath -Path 'C:\Windows' -Reason 'protected location'
+            Add-BlockedPath -Path 'C:\' -Reason 'root drive'
+            $script:state.BlockedPath.Count | Should -Be 2
+        }
+
+        It 'Is populated by Test-PathSafe when a path is refused' {
+            $null = Test-PathSafe -Path (Join-Path $env:USERPROFILE 'Documents\Scripts\app\.venv')
+            $script:state.BlockedPath.Count | Should -BeGreaterThan 0
+            $script:state.BlockedPath[0].Reason | Should -BeLike 'protected location*'
+        }
+    }
+
+    Context 'Add-SkippedFinding' {
+
+        BeforeEach { Clear-FindingState }
+
+        It 'Records status, reason and size together' {
+            Add-SkippedFinding -Type 'VirtualEnv' -Name 'venv' -Path 'C:\p\.venv' `
+                -Reason 'blocked by the protected path policy' -SizeBytes 2048
+
+            $finding = $script:state.Findings[0]
+            $finding.Status | Should -Be 'Skipped'
+            $finding.Reason | Should -Be 'blocked by the protected path policy'
+            $finding.SizeBytes | Should -Be 2048
+        }
+
+        It 'Defaults the size to zero' {
+            Add-SkippedFinding -Type 'Profile' -Name 'p.ps1' -Path 'C:\p.ps1' -Reason 'blocked'
+            $script:state.Findings[0].SizeBytes | Should -Be 0
+        }
+    }
+
+    Context 'Add-ManualAction' {
+
+        BeforeEach { $script:state.ManualAction.Clear() }
+        AfterEach { $script:state.ManualAction.Clear() }
+
+        It 'Records the item, reason and command' {
+            Add-ManualAction -Item 'py.exe' -Reason 'not removed' -Command 'Remove-Item py.exe'
+            $script:state.ManualAction[0].Item | Should -Be 'py.exe'
+            $script:state.ManualAction[0].Reason | Should -Be 'not removed'
+            $script:state.ManualAction[0].Command | Should -Be 'Remove-Item py.exe'
+        }
+
+        It 'Accepts an omitted command' {
+            Add-ManualAction -Item 'profile.ps1' -Reason 'needs review'
+            $script:state.ManualAction[0].Command | Should -Be ''
+        }
+    }
+
+    Context 'Write-MarkdownReport' {
+
+        BeforeEach {
+            Clear-FindingState
+            $script:state.ManualAction.Clear()
+            $script:state.BlockedPath.Clear()
+            $script:state.PhaseTiming.Clear()
+            $null = $script:state.Transcript.Clear()
+            $script:state.ErrorCountAtStart = $Error.Count
+            $script:config.MarkdownFile = Join-Path $TestDrive 'review.md'
+            $script:config.ScanOnly = $false
+            $script:config.RestoreMode = $false
+        }
+
+        It 'Writes the file with the expected core sections' {
+            (Add-Finding -Type 'Directory' -Name 'Python314' -Path 'C:\Python314' -SizeBytes 1024).Status = 'Removed'
+            Write-MarkdownReport
+
+            Test-Path -LiteralPath $script:config.MarkdownFile | Should -BeTrue
+            $content = Get-Content -LiteralPath $script:config.MarkdownFile -Raw
+            $content | Should -Match '# Python Removal Run Log'
+            $content | Should -Match '## Summary'
+            $content | Should -Match '## Configuration'
+            $content | Should -Match '## Environment'
+            $content | Should -Match '## Findings by Type'
+        }
+
+        It 'Reports the exit code with its meaning' {
+            $script:state.ExitCode = 2
+            Write-MarkdownReport
+            (Get-Content -LiteralPath $script:config.MarkdownFile -Raw) |
+                Should -Match '\| Exit Code \| 2 - completed, but one or more operations failed \|'
+            $script:state.ExitCode = 0
+        }
+
+        It 'Adds a Failures section with the recorded reason' {
+            $finding = Add-Finding -Type 'Registry' -Name 'HKLM:\Software\Python' -Path 'HKLM:\Software\Python'
+            $finding.Status = 'Failed'
+            $finding.Reason = 'UnauthorizedAccessException: access denied'
+
+            Write-MarkdownReport
+
+            $content = Get-Content -LiteralPath $script:config.MarkdownFile -Raw
+            $content | Should -Match '## Failures'
+            $content | Should -Match 'UnauthorizedAccessException: access denied'
+        }
+
+        It 'Adds a Skipped section listing the reason' {
+            Add-SkippedFinding -Type 'VirtualEnv' -Name 'venv' -Path 'C:\p\.venv' `
+                -Reason 'blocked by the protected path policy'
+            Write-MarkdownReport
+
+            $content = Get-Content -LiteralPath $script:config.MarkdownFile -Raw
+            $content | Should -Match '## Skipped'
+            $content | Should -Match 'blocked by the protected path policy'
+        }
+
+        It 'Separates reclaimable size from size left in place' {
+            (Add-Finding -Type 'Directory' -Name 'a' -Path 'C:\a' -SizeBytes 4096).Status = 'Found'
+            Add-SkippedFinding -Type 'VirtualEnv' -Name 'b' -Path 'C:\b' -Reason 'blocked' -SizeBytes 2048
+            $script:config.ScanOnly = $true
+
+            Write-MarkdownReport
+
+            $content = Get-Content -LiteralPath $script:config.MarkdownFile -Raw
+            $content | Should -Match '\| Reclaimable Size \| 4 KB \|'
+            $content | Should -Match '\| Left In Place By Skips \| 2 KB \|'
+        }
+
+        It 'Adds a Paths Refused section' {
+            Add-BlockedPath -Path 'C:\Users\X\Documents' -Reason 'protected location: C:\Users\X\Documents'
+            Write-MarkdownReport
+            (Get-Content -LiteralPath $script:config.MarkdownFile -Raw) |
+                Should -Match '## Paths Refused by the Safety Gate'
+        }
+
+        It 'Adds a Manual Action section with the command' {
+            Add-ManualAction -Item 'py.exe' -Reason 'not removed' -Command "Remove-Item -LiteralPath 'py.exe'"
+            Write-MarkdownReport
+
+            $content = Get-Content -LiteralPath $script:config.MarkdownFile -Raw
+            $content | Should -Match '## Manual Action Required'
+            $content | Should -Match 'Remove-Item -LiteralPath'
+        }
+
+        It 'Adds phase timings when they were recorded' {
+            [void]$script:state.PhaseTiming.Add(
+                [pscustomobject]@{ Name = 'Registry'; Seconds = 1.25; Findings = 4 })
+            Write-MarkdownReport
+
+            $content = Get-Content -LiteralPath $script:config.MarkdownFile -Raw
+            $content | Should -Match '## Phase Timings'
+            $content | Should -Match '\| Registry \| 1.25s \| 4 \|'
+        }
+
+        It 'Embeds the transcript in a collapsed block' {
+            Write-LogEntry -Tag 'registry' -Message 'removed: HKLM:\Software\Python'
+            Write-MarkdownReport
+
+            $content = Get-Content -LiteralPath $script:config.MarkdownFile -Raw
+            $content | Should -Match '## Console Output'
+            $content | Should -Match '<details>'
+            $content | Should -Match '\[registry\] removed'
+        }
+
+        It 'Escapes a pipe in a finding name so the table survives' {
+            (Add-Finding -Type 'Program' -Name 'Odd | Name' -Path 'C:\odd').Status = 'Removed'
+            Write-MarkdownReport
+            (Get-Content -LiteralPath $script:config.MarkdownFile -Raw) | Should -Match 'Odd \\\| Name'
+        }
+
+        It 'Writes a usable report even with no findings at all' {
+            Write-MarkdownReport
+            Test-Path -LiteralPath $script:config.MarkdownFile | Should -BeTrue
+            (Get-Content -LiteralPath $script:config.MarkdownFile -Raw) | Should -Match '\| Items Found \| 0 \|'
+        }
+
+        It 'Does not throw when the destination cannot be written' {
+            $script:config.MarkdownFile = Join-Path $TestDrive 'no-such-dir\deeper\review.md'
+            { Write-MarkdownReport -WarningAction SilentlyContinue } | Should -Not -Throw
+        }
+
+        It 'Still writes the report when WhatIf is in effect' {
+            (Add-Finding -Type 'Directory' -Name 'Python314' -Path 'C:\Python314').Status = 'Found'
+
+            # Script-level -WhatIf reaches nested functions as this preference, and Set-Content
+            # would honour it and silently write nothing.
+            $WhatIfPreference = $true
+            Write-MarkdownReport
+
+            Test-Path -LiteralPath $script:config.MarkdownFile |
+                Should -BeTrue -Because 'the review report is the point of a preview run'
+            (Get-Content -LiteralPath $script:config.MarkdownFile -Raw) | Should -Match '\| Items Found \| 1 \|'
+        }
+    }
+}
+
 Describe 'Logging' -Tag 'Logging' {
 
     Context 'Write-LogEntry' {

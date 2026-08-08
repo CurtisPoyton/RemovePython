@@ -22,8 +22,12 @@ RemovePython/
 ├── PSScriptAnalyzerSettings.psd1 # Lint configuration; the quality gate for this repo
 ├── CLAUDE.md                     # This file
 ├── README.md                     # User documentation
-└── *.txt, *.csv, *.json          # Generated logs and reports (git-ignored)
+└── *.md, *.txt, *.csv, *.json    # Generated logs and reports (git-ignored)
 ```
+
+Each run emits four artefacts sharing one timestamp: a Markdown review report, a plain-text log, a
+CSV of findings, and an environment backup. The Markdown report is the one to read when diagnosing a
+run.
 
 ---
 
@@ -56,9 +60,14 @@ RemovePython/
 - Test with `-ScanOnly` before making changes, and `-WhatIf` before trusting a new code path.
 - Route deletions through `Remove-ItemSafely`, `Remove-FileSafely` or `Remove-RegistryKeySet`.
 - Record every discovered item with `Add-Finding` and set `.Status` on the returned object to
-  `Removed`, `Failed` or `Skipped`. All counters, the CSV report and the exit code derive from
+  `Removed`, `Failed` or `Skipped`. All counters, both reports and the exit code derive from
   findings, so an unrecorded operation is invisible to every one of them.
-- Report failures through `Write-RemovalFailure`, which names the concrete exception type.
+- Set `.Reason` whenever the status is not `Removed`. Use `Write-RemovalFailure` for failures and
+  `Add-SkippedFinding` for skips; both fill it in for you. A `Skipped` or `Failed` row with an empty
+  reason is a defect — the review report exists to answer "why".
+- Call `Add-ManualAction` whenever the run leaves something for the user to finish by hand.
+- Test a `List` for emptiness with `$null -eq $list`, never `-not $list`. An empty
+  `List[T]` is falsy in PowerShell, which silently disabled the whole blocked-path record once.
 
 ---
 
@@ -165,6 +174,13 @@ Virtual environments found beneath Documents are likewise reported and skipped, 
 | `Test-UninstallerTrust` | Authenticode check before running a vendor uninstaller | Refuses unsigned executables recorded under HKCU, which is writable without elevation |
 | `Test-InstallationPresent` | Orphan detection | Reports *present* when it cannot prove otherwise, so a still-registered MSI product is never stranded |
 | `Sync-ProcessPath` | Rebuilds `$env:Path` from the registry before verification | Without it, verification reads the stale launch-time PATH and reports false failures |
+| `Write-MarkdownReport` | Builds the review report | Called from `finally`, so it survives a crash and runs under `-WhatIf`. Uses `Write-` rather than `New-` deliberately: a `New-` verb would demand `SupportsShouldProcess`, which would suppress the report in exactly the preview mode it is most useful for |
+| `ConvertTo-MarkdownCell` | Escapes and truncates a table cell | Pipes and newlines in a program name or exception message would otherwise break the table |
+| `Add-BlockedPath` | Records what the safety gate refused, deduplicated | Feeds the report's "Paths refused" section |
+
+The script never prunes its own output. The reference implementation this report style follows does,
+but `$PSScriptRoot` is inside Documents here and that tree is protected, so a retention sweep would
+be dead code.
 
 ### Concurrency
 
